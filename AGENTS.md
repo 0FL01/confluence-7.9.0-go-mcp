@@ -6,8 +6,8 @@ Target: **only Confluence 7.9.0 (server, selfhosted)**. Data Center and Cloud ar
 - `main.go`: `run`/`main` bootstrap, `loadConfig` configuration, `setupServer` tool schemas, and `handle*` handlers.
 - `main.go`: `ConfluenceClient.executeRequest`, `doRequest`, and `getJSON` own REST transport and response handling.
 - `main_test.go`: handler/client tests with `httptest`; `TestRun` injects a serve function without starting stdio.
-- `.github/workflows/ci.yml`: Go version and CI checks.
-- `.github/workflows/release.yml`: six cross-platform artifacts and checksums; local builds use `go build` (no build script).
+- `.goreleaser.yaml`: six-platform builds, archives and checksums shared by CI snapshots and releases.
+- `.github/workflows/`: CI tests/lint/snapshots and manual-only Release (new version on main); local builds use `go build`, no script.
 
 ## Rules
 - Keep stdout reserved for MCP protocol traffic; diagnostics belong on stderr.
@@ -27,6 +27,7 @@ Use Go 1.25.5 as specified by `go.mod` and CI; run commands from the repository 
 - `go vet ./...`
 - `go test -v -race -coverprofile=coverage.out -covermode=atomic ./...`
 - `go build -v -o confluence-mcp .` (Windows: `confluence-mcp.exe`; module/server identity stays unchanged).
+- Packaging: `goreleaser check` then `goreleaser release --snapshot --clean` (no publication).
 - Focused example: `go test -v -run '^TestHandleUpdateContent' .`
 - Configuration tests isolate cwd and all four `CONFLUENCE_*` variables (unset differs from empty); never use production credentials or parallel cwd/ENV tests.
 

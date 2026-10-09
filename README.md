@@ -1,18 +1,41 @@
-# Confluence 7.9.0 Server MCP (Go)
+# Confluence MCP
 
-[![Go Version](https://img.shields.io/badge/Go-1.25.5-blue.svg)](https://golang.org)
-[![MCP Go SDK](https://img.shields.io/badge/mcp--go-0.43.2-green.svg)](https://github.com/mark3labs/mcp-go)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+Give your AI agent five tools to read, search, create, and update Confluence content and find spaces. A single Go binary runs locally over MCP stdio and calls your Confluence REST API.
 
-A stdio Model Context Protocol (MCP) server for **self-hosted Atlassian Confluence Server 7.9.0**. It lets MCP clients retrieve and search content, create pages and blog posts, update content, and list or search spaces. Data Center and Cloud are not compatibility targets.
+**Supported version: Confluence Server 7.9.0, self-hosted only.** Data Center and Cloud are not compatibility targets.
 
-The executable is named `confluence-mcp`. The canonical repository and Go module are [`github.com/0FL01/confluence-7.9.0-go-mcp`](https://github.com/0FL01/confluence-7.9.0-go-mcp). The MCP server name is `confluence-7.9.0-go-mcp`, and its application version is `1.0.0`.
+| Tool | What it does |
+| --- | --- |
+| `confluence_get_content` | Retrieve content by ID, including its storage body |
+| `confluence_search_content` | Search content and spaces using CQL |
+| `confluence_create_content` | Create a page or blog post with a storage-format body |
+| `confluence_update_content` | Update content while preserving unchanged fields |
+| `confluence_list_spaces` | List spaces or search their titles |
 
-## Installation and MCP Configuration
+## Quick start
 
-### Build from source
+### 1. Prepare a private `.env`
 
-Source builds are the primary installation method. Use **Go 1.25.5**, the version specified by `go.mod` and GitHub Actions.
+Use a **personal access token from Confluence Server 7.9.0**. The server sends it as `Authorization: Bearer <token>`.
+
+Create `.env` in a private configuration directory, for example `/absolute/path/to/private/confluence-config/.env`:
+
+```dotenv
+CONFLUENCE_BASE_URL='https://confluence.example.invalid/confluence'
+CONFLUENCE_API_TOKEN='replace-with-your-server-personal-access-token'
+```
+
+Replace the example URL and token. Include your Confluence context path if applicable. Keep the file out of version control and restrict access, for example on Linux or macOS:
+
+```bash
+chmod 600 /absolute/path/to/private/confluence-config/.env
+```
+
+The server reads `.env` from its **working directory**. Inherited environment variables override the same keys in the file, **including empty values**; an empty inherited token causes startup to fail.
+
+### 2. Install `confluence-mcp`
+
+No release has been published under the [canonical repository](https://github.com/0FL01/confluence-7.9.0-go-mcp) yet. Build from source with **Go 1.25.5**, as specified by `go.mod` and CI:
 
 ```bash
 git clone https://github.com/0FL01/confluence-7.9.0-go-mcp.git
@@ -20,23 +43,18 @@ cd confluence-7.9.0-go-mcp
 go build -o confluence-mcp .
 ```
 
-This produces `confluence-mcp` in the repository root. On Windows, use `go build -o confluence-mcp.exe .` instead. On Linux or macOS, you can optionally install the binary into `~/.local/bin`:
+On Windows, use `go build -o confluence-mcp.exe .`. On Linux or macOS, you can install the binary into `~/.local/bin`:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
 install -m 755 confluence-mcp "$HOME/.local/bin/confluence-mcp"
 ```
 
-### Private configuration and OpenCode
+After the first manual release, you can use the prebuilt archives described below.
 
-Create a `.env` file in a private configuration directory, for example `/absolute/path/to/private/confluence-config/.env`, with your Confluence URL and personal access token:
+### 3. Configure OpenCode
 
-```dotenv
-CONFLUENCE_BASE_URL='https://confluence.example.invalid/confluence'
-CONFLUENCE_API_TOKEN='replace-with-your-server-personal-access-token'
-```
-
-Configure OpenCode with the absolute path to the executable and set `cwd` to that configuration directory:
+Merge this into your project or global `opencode.jsonc`, preserving other settings:
 
 ```json
 {
@@ -52,30 +70,70 @@ Configure OpenCode with the absolute path to the executable and set `cwd` to tha
 }
 ```
 
-Replace the executable path with the actual location, such as `/home/your-user/.local/bin/confluence-mcp` after installation. The server automatically reads `.env` from its working directory and verifies authentication before starting MCP stdio. See [Configuration](#configuration) for precedence and startup behavior.
+Replace both paths with real absolute paths; `cwd` must contain your `.env`. For example, the command can be `/home/your-user/.local/bin/confluence-mcp` after installation. The server loads the file itself. Keep credentials in the private `.env`; inherited `CONFLUENCE_*` values must be unset if the file should supply those keys.
 
-The server communicates over stdio. Standard output is reserved for MCP protocol messages; diagnostics go to standard error. For development, you can also run `go run .` from the repository root with a `.env` there or with the environment variables set.
+### 4. Verify startup and read content
 
-### Prebuilt binaries (when available)
-
-No release has been published under the canonical repository yet. Once a release is available, download the appropriate artifact from the [canonical Releases page](https://github.com/0FL01/confluence-7.9.0-go-mcp/releases). The GitHub release workflow builds these six standalone binaries with `CGO_ENABLED=0` and publishes `checksums.txt` alongside them:
-
-| Platform | Artifact |
-| --- | --- |
-| Linux amd64 | `confluence-mcp-linux-amd64` |
-| Linux arm64 | `confluence-mcp-linux-arm64` |
-| macOS amd64 | `confluence-mcp-macos-amd64` |
-| macOS arm64 | `confluence-mcp-macos-arm64` |
-| Windows amd64 | `confluence-mcp-windows-amd64.exe` |
-| Windows arm64 | `confluence-mcp-windows-arm64.exe` |
-
-On Linux or macOS, make the downloaded file executable and use its absolute path as the MCP command. For example, for a future Linux amd64 release:
+Restart OpenCode after configuring the server, then check it from the same workspace:
 
 ```bash
-chmod +x confluence-mcp-linux-amd64
+opencode mcp list
 ```
 
-## Configuration
+Before starting MCP stdio, the server checks `/rest/api/user/current` and requires HTTP `200` with `type: "known"`. Once connected, ask OpenCode to call `confluence_get_content` with the `contentId` of a page your account can access. This also verifies that account's permission to read the page.
+
+If startup fails, check `cwd`, `.env` readability and syntax, inherited environment overrides, the Confluence URL, and the PAT. Diagnostics go to stderr; stdout is reserved for MCP protocol traffic. See the configuration details below for the full startup contract.
+
+<details>
+<summary>Prebuilt archives and checksum verification</summary>
+
+Once a release is available, download the archive for your platform and `checksums.txt` from the [canonical Releases page](https://github.com/0FL01/confluence-7.9.0-go-mcp/releases).
+
+| Platform | Archive |
+| --- | --- |
+| Linux amd64 | `confluence-mcp_linux_amd64.tar.gz` |
+| Linux arm64 | `confluence-mcp_linux_arm64.tar.gz` |
+| macOS amd64 | `confluence-mcp_darwin_amd64.tar.gz` |
+| macOS arm64 | `confluence-mcp_darwin_arm64.tar.gz` |
+| Windows amd64 | `confluence-mcp_windows_amd64.zip` |
+| Windows arm64 | `confluence-mcp_windows_arm64.zip` |
+
+All six archives contain the native `confluence-mcp` binary (`confluence-mcp.exe` on Windows), `README.md`, and `LICENSE`. Binaries are built with `CGO_ENABLED=0`; `checksums.txt` contains SHA-256 hashes.
+
+Verify the selected archive before extracting it. For Linux amd64:
+
+```bash
+sha256sum confluence-mcp_linux_amd64.tar.gz
+```
+
+Compare the printed hash with the entry for **that exact filename** in the downloaded `checksums.txt`. On macOS, use `shasum -a 256` with your selected archive instead. After the hash matches, extract and install; for Linux amd64:
+
+```bash
+tar -xzf confluence-mcp_linux_amd64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 755 confluence-mcp "$HOME/.local/bin/confluence-mcp"
+```
+
+On Windows, compute the SHA-256 hash in PowerShell, compare it with the matching `checksums.txt` entry, then extract the ZIP. For Windows amd64:
+
+```powershell
+Get-FileHash .\confluence-mcp_windows_amd64.zip -Algorithm SHA256
+```
+
+After the hash matches:
+
+```powershell
+Expand-Archive .\confluence-mcp_windows_amd64.zip -DestinationPath .\confluence-mcp
+```
+
+Use the extracted binary's absolute path as the MCP command.
+
+</details>
+
+<details>
+<summary>Configuration, authentication, and other MCP clients</summary>
+
+### Configuration
 
 `CONFLUENCE_API_TOKEN` is required. It must be a **personal access token from Confluence Server 7.9.0**, sent as `Authorization: Bearer <token>`. A Confluence Cloud API token is not the authentication method used here.
 
@@ -135,7 +193,12 @@ Invalid configuration, an unreadable or malformed `.env`, anonymous users, HTML 
 
 This check proves authentication as a known user. Access to individual content and spaces still depends on that user's permissions.
 
-## Tools
+</details>
+
+<details>
+<summary>Tool arguments and REST contracts</summary>
+
+### Tool contract
 
 The five tool IDs and their argument names are listed below. Successful calls return the **raw Confluence REST response JSON as MCP text**. Validation and API failures return an MCP tool-error result. Request context is retained, and the HTTP client has a 30-second timeout.
 
@@ -219,7 +282,14 @@ This tool returns one result page, including when `searchText` is omitted. Advan
 }
 ```
 
-## Development and Builds
+</details>
+
+<details>
+<summary>Development, CI, and manual releases</summary>
+
+### Development
+
+The executable is `confluence-mcp` (`confluence-mcp.exe` on Windows). The Go module is [`github.com/0FL01/confluence-7.9.0-go-mcp`](https://github.com/0FL01/confluence-7.9.0-go-mcp); the MCP server name remains `confluence-7.9.0-go-mcp`, with application version `1.0.0`. Dependencies are pinned in `go.mod`, including `github.com/mark3labs/mcp-go` v0.43.2 and `github.com/joho/godotenv` v1.5.1.
 
 Use Go 1.25.5 and run checks from the repository root:
 
@@ -231,32 +301,45 @@ go build -v -o confluence-mcp .
 
 Configuration tests isolate `CONFLUENCE_API_TOKEN`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_API_BASE_PATH`, and `CONFLUENCE_HOST`; no production credentials are used. The automated tests use local HTTP fixtures to verify client contracts; they do not establish compatibility against a live Confluence installation.
 
-Local builds use `go build`. GitHub Actions runs tests and lint plus a six-target build matrix; the release workflow publishes the six platform builds for version tags matching `v*.*.*`.
+For local development, run `go run .` from the repository root with a `.env` there or with the environment variables set.
 
-## Project Structure
+### CI and release builds
 
-```text
-.
-├── main.go                       # Server, tool handlers, and REST client
-├── main_test.go                  # Client and handler contract tests
-├── go.mod                        # Go module and dependency versions
-├── go.sum                        # Dependency checksums
-├── .github/workflows/ci.yml      # Test, lint, and six-target build checks
-├── .github/workflows/release.yml # Cross-platform release builds
-├── LICENSE                       # MIT license and original copyright
-└── README.md                     # This file
-```
+Local builds use `go build`. GitHub Actions keeps the Test and Lint gates, validates `.goreleaser.yaml` with `goreleaser check`, and builds all six platforms with `goreleaser release --snapshot --clean`. Snapshot builds do not publish releases.
 
-## API Reference
+GoReleaser v2 builds the root package for Linux, macOS, and Windows on amd64 and arm64, with `CGO_ENABLED=0` and `-s -w`. It packages the archives listed above and generates `checksums.txt`.
+
+### Publish a release manually
+
+The Release workflow runs **only through `workflow_dispatch`**. After pushing the intended changes to `main`:
+
+1. Open [Actions → Release](https://github.com/0FL01/confluence-7.9.0-go-mcp/actions/workflows/release.yml).
+2. Select **Run workflow** and choose branch **main**.
+3. Enter the required **version**, for example `v1.0.0`.
+4. Select **Run workflow** to publish the release.
+
+The version must be stable `vMAJOR.MINOR.PATCH`, with no leading zeros (except the number `0` itself). An existing version fails. The workflow checks the selected `main` commit before creating and pushing a new tag for that SHA, then runs `goreleaser release --clean`. A tag push alone does not trigger publishing.
+
+If a failure occurs after the tag is pushed, a tag or draft release may remain. Resolve that state manually; the workflow does not force-update tags or automatically clean up a failed release.
+
+</details>
+
+<details>
+<summary>Confluence API references</summary>
 
 - [Confluence Server REST API 7.9.0](https://docs.atlassian.com/ConfluenceServer/rest/7.9.0/) — pinned REST specification for the target version.
 - [Confluence 7.9 release notes](https://confluence.atlassian.com/doc/confluence-7-9-release-notes-1026537698.html) — Server personal access token support.
 - [CQL field reference](https://developer.atlassian.com/server/confluence/cql-field-reference/).
 - [Advanced searching using CQL](https://developer.atlassian.com/server/confluence/advanced-searching-using-cql/).
 
-## License and Acknowledgments
+</details>
+
+## License
 
 This project is licensed under the [MIT License](LICENSE). The original license and copyright are preserved.
+
+<details>
+<summary>Attribution and upstream release history</summary>
 
 Historical attribution:
 - Upstream Go implementation: [Anudeep Dhavaleswarapu's atlassian-confluence-dc-go-mcp](https://github.com/anudeepd/atlassian-confluence-dc-go-mcp).
@@ -273,3 +356,5 @@ These versions belong to the original upstream module, not to this repository's 
 - **v1.0.2:** documented building with older Go versions.
 - **v1.0.1 (deprecated upstream):** fixed the upstream module path; later deprecated for configuration issues.
 - **v1.0.0 (deprecated upstream):** initial Go rewrite, core Confluence tools, multi-platform builds and MCP support; later deprecated for module configuration issues.
+
+</details>
