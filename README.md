@@ -1,311 +1,225 @@
-# Atlassian Confluence Data Center MCP Server (Go)
+# Confluence 7.9.0 Server MCP (Go)
 
 [![Go Version](https://img.shields.io/badge/Go-1.25.5-blue.svg)](https://golang.org)
-[![MCP](https://img.shields.io/badge/MCP-0.43.2-green.svg)](https://github.com/mark3labs/mcp-go)
+[![MCP Go SDK](https://img.shields.io/badge/mcp--go-0.43.2-green.svg)](https://github.com/mark3labs/mcp-go)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A Model Context Protocol (MCP) server implementation in Go for interacting with Atlassian Confluence Data Center edition. This server enables AI assistants and other MCP clients to read, search, create, and update Confluence content programmatically.
+A stdio Model Context Protocol (MCP) server for **self-hosted Atlassian Confluence Server 7.9.0**. It lets MCP clients retrieve and search content, create pages and blog posts, update content, and list or search spaces. Data Center and Cloud are not compatibility targets.
 
-> **Note**: This is a Go rewrite of the original TypeScript implementation. Special thanks to [b1ff/atlassian-dc-mcp](https://github.com/b1ff/atlassian-dc-mcp) for the original implementation that inspired this project.
+The canonical repository and Go module are [`github.com/0FL01/confluence-7.9.0-go-mcp`](https://github.com/0FL01/confluence-7.9.0-go-mcp). The MCP server name is `confluence-7.9.0-go-mcp`, and its application version is `1.0.0`.
 
-## Features
+## Installation and MCP Configuration
 
-- **Search & Retrieve**: Search for content using CQL (Confluence Query Language) and retrieve content by ID
-- **Content Management**: Create new pages and blog posts, update existing content
-- **Space Management**: List and search Confluence spaces
-- **Secure Authentication**: Bearer token authentication support
-- **High Performance**: Built with Go for speed and efficiency
-- **Zero Dependencies**: Minimal external dependencies, uses standard library where possible
+### Build from source
 
-## Tools
-
-The server provides the following MCP tools:
-
-### `confluence_get_content`
-Get Confluence content by ID from the Confluence Data Center edition instance.
-
-**Arguments:**
-- `contentId` (string, required): Confluence Data Center content ID
-- `expand` (string, optional): Comma-separated list of properties to expand
-
-### `confluence_search_content`
-Search for content in Confluence Data Center edition instance using CQL.
-
-**Arguments:**
-- `cql` (string, required): Confluence Query Language (CQL) search string for Confluence Data Center
-- `limit` (number, optional): Maximum number of results to return (default: 25)
-- `start` (number, optional): The starting index of the results to return
-- `expand` (string, optional): Comma-separated list of properties to expand
-
-### `confluence_create_content`
-Create new content in Confluence Data Center edition instance.
-
-**Arguments:**
-- `title` (string, required): The title of the new content
-- `spaceKey` (string, required): The key of the space where content will be created
-- `content` (string, required): The content of the page in Confluence storage format
-- `type` (string, optional): The type of content (page or blogpost)
-- `parentId` (string, optional): The ID of the parent content
-
-### `confluence_update_content`
-Update existing content in Confluence Data Center edition instance.
-
-**Arguments:**
-- `contentId` (string, required): The ID of the content to update
-- `version` (number, optional): The new version number (defaults to current version + 1)
-- `title` (string, optional): New title for the content
-- `content` (string, optional): New content in storage format
-- `versionComment` (string, optional): A comment for the new version
-
-### `confluence_list_spaces`
-List and search for spaces in Confluence Data Center edition instance.
-
-**Arguments:**
-- `searchText` (string, optional): Text to search for in space names or descriptions (returns all spaces if omitted)
-- `limit` (number, optional): Maximum number of spaces to return
-- `start` (number, optional): The starting index of the results to return
-- `expand` (string, optional): Comma-separated list of properties to expand
-
-## Usage Modes (MCP Configuration)
-
-> If you are unsure which option to choose:
-> - Use **Pre-built Binary** if you don’t use Go
-> - Use **go install** if you are a Go developer
-
-This MCP server can be used in **three supported ways**.
-Choose **one** based on how you want to install and run it.
-
-### Option 1: Using a Pre-Built Binary (Recommended for non-Go users)
-
-#### Install
-
-Download the appropriate binary from the
-[Releases page](https://github.com/anudeepd/atlassian-confluence-dc-go-mcp/releases)
-and place it somewhere on your system (e.g. `/usr/local/bin`).
+Source builds are the primary installation method. Use **Go 1.25.5**, the version specified by `go.mod` and GitHub Actions.
 
 ```bash
-chmod +x atlassian-confluence-dc-go-mcp
+git clone https://github.com/0FL01/confluence-7.9.0-go-mcp.git
+cd confluence-7.9.0-go-mcp
+go build ./...
 ```
 
-#### MCP Configuration
+This produces `confluence-7.9.0-go-mcp` in the repository root (`confluence-7.9.0-go-mcp.exe` on Windows). Configure your MCP client with the absolute path to that binary:
 
 ```json
 {
   "mcpServers": {
     "confluence": {
-      "command": "/usr/local/bin/atlassian-confluence-dc-go-mcp",
+      "command": "/absolute/path/to/confluence-7.9.0-go-mcp",
       "env": {
-        "CONFLUENCE_API_TOKEN": "your-api-token",
-        "CONFLUENCE_BASE_URL": "https://confluence.example.com"
+        "CONFLUENCE_API_TOKEN": "your-server-personal-access-token",
+        "CONFLUENCE_BASE_URL": "https://confluence.example.com/confluence"
       }
     }
   }
 }
 ```
 
+The server communicates over stdio. Standard output is reserved for MCP protocol messages; diagnostics go to standard error. For development, you can also run `go run .` from the repository root with the same environment variables set.
 
+### Prebuilt binaries (when available)
 
-### Option 2: Using `go install` (Recommended for Go users)
+No release has been published under the canonical repository yet. Once a release is available, download the appropriate artifact from the [canonical Releases page](https://github.com/0FL01/confluence-7.9.0-go-mcp/releases). The GitHub release workflow builds these six standalone binaries with `CGO_ENABLED=0` and publishes `checksums.txt` alongside them:
 
-#### Install
+| Platform | Artifact |
+| --- | --- |
+| Linux amd64 | `confluence-7.9.0-go-mcp-linux-amd64` |
+| Linux arm64 | `confluence-7.9.0-go-mcp-linux-arm64` |
+| macOS amd64 | `confluence-7.9.0-go-mcp-macos-amd64` |
+| macOS arm64 | `confluence-7.9.0-go-mcp-macos-arm64` |
+| Windows amd64 | `confluence-7.9.0-go-mcp-windows-amd64.exe` |
+| Windows arm64 | `confluence-7.9.0-go-mcp-windows-arm64.exe` |
 
-```bash
-go install github.com/anudeepd/atlassian-confluence-dc-go-mcp@latest
-```
-
-Ensure `$GOBIN` (or `~/go/bin`) is in your `PATH`.
-
-```bash
-export PATH="$HOME/go/bin:$PATH"
-```
-
-#### MCP Configuration
-
-Because the binary is on your `PATH`, you only need the command name:
-
-```json
-{
-  "mcpServers": {
-    "confluence": {
-      "command": "atlassian-confluence-dc-go-mcp",
-      "env": {
-        "CONFLUENCE_API_TOKEN": "your-api-token",
-        "CONFLUENCE_BASE_URL": "https://confluence.example.com"
-      }
-    }
-  }
-}
-```
-
-
-
-### Option 3: Running from Source (Development / Contribution)
-
-#### Run directly
+On Linux or macOS, make the downloaded file executable and use its absolute path as the MCP command. For example, for a future Linux amd64 release:
 
 ```bash
-git clone https://github.com/anudeepd/atlassian-confluence-dc-go-mcp.git
-cd atlassian-confluence-dc-go-mcp
-go run .
+chmod +x confluence-7.9.0-go-mcp-linux-amd64
 ```
-
-#### MCP Configuration (not recommended for production)
-
-```json
-{
-  "mcpServers": {
-    "confluence-dev": {
-      "command": "go",
-      "args": ["run", "."],
-      "cwd": "/path/to/atlassian-confluence-dc-go-mcp",
-      "env": {
-        "CONFLUENCE_API_TOKEN": "your-api-token",
-        "CONFLUENCE_BASE_URL": "https://confluence.example.com"
-      }
-    }
-  }
-}
-```
-
-
 
 ## Configuration
 
-The server requires the following environment variables:
+`CONFLUENCE_API_TOKEN` is required. It must be a **personal access token from Confluence Server 7.9.0**, sent as `Authorization: Bearer <token>`. A Confluence Cloud API token is not the authentication method used here.
 
-### Required Variables
+Set at least one URL variable. The first non-empty value wins in this order:
 
-- `CONFLUENCE_API_TOKEN`: Your Confluence API token (Bearer token)
-- `CONFLUENCE_BASE_URL`: The base URL of your Confluence instance (e.g., `https://confluence.example.com`)
+| Priority | Variable | Purpose |
+| --- | --- | --- |
+| 1 | `CONFLUENCE_BASE_URL` | Confluence instance URL, including any context path |
+| 2 | `CONFLUENCE_API_BASE_PATH` | Alternative URL, which may already end in `/rest/api` |
+| 3 | `CONFLUENCE_HOST` | Alternative hostname or URL |
 
-### Alternative URL Variables
+URLs must have a hostname, use `http` or `https`, and contain no query string or fragment. Values without a scheme default to HTTPS. The server preserves the context path and appends `/rest/api` unless the URL path already ends in `/rest/api`.
 
-You can also use one of these instead of `CONFLUENCE_BASE_URL`:
-- `CONFLUENCE_API_BASE_PATH`: Full API path
-- `CONFLUENCE_HOST`: Just the hostname (will be prefixed with `https://`)
+| Configured value | REST root |
+| --- | --- |
+| `confluence.example.com` | `https://confluence.example.com/rest/api` |
+| `https://confluence.example.com/confluence` | `https://confluence.example.com/confluence/rest/api` |
+| `https://confluence.example.com/confluence/rest/api` | `https://confluence.example.com/confluence/rest/api` |
 
-The server will automatically append `/rest/api` to the base URL if not present.
-
-### Example Configuration
-
-```bash
-export CONFLUENCE_API_TOKEN="your-api-token-here"
-export CONFLUENCE_BASE_URL="https://confluence.example.com"
-```
-
-## Development
-
-### Running Tests
+Example environment for running from the repository root:
 
 ```bash
-# Run all tests
-go test -v
-
-# Run tests with coverage
-go test -v -cover
-
-# Generate coverage report
-go test -coverprofile=coverage.out
-go tool cover -html=coverage.out
+export CONFLUENCE_API_TOKEN="your-server-personal-access-token"
+export CONFLUENCE_BASE_URL="https://confluence.example.com/confluence"
+go run .
 ```
 
-### Building
+## Tools
+
+The five tool IDs and their argument names are listed below. Successful calls return the **raw Confluence REST response JSON as MCP text**. Validation and API failures return an MCP tool-error result. Request context is retained, and the HTTP client has a 30-second timeout.
+
+Optional numeric arguments must be finite whole numbers in the REST signed 32-bit integer range. `limit` and `start` accept `0` through `2147483647`; `version` accepts `1` through `2147483647`. Fractional and out-of-range values are rejected. An omitted `limit` defaults to `25`; an explicit `limit: 0` is sent unchanged to Confluence and does not carry a count-only guarantee. Pagination applies only to search and space listing.
+
+### `confluence_get_content`
+
+Retrieve content with `GET /content/{contentId}` relative to the configured REST root.
+
+**Arguments:**
+- `contentId` (string, required): Non-empty content ID; IDs containing `/` or `..` are rejected before a request.
+- `expand` (string, optional): Comma-separated content expansions, such as `space,version`.
+
+`body.storage` is always included in the expansions, together with any caller-supplied expansions. This request has no pagination parameters.
+
+### `confluence_search_content`
+
+Search with `GET /search` using caller-supplied CQL, passed through unchanged.
+
+**Arguments:**
+- `cql` (string, required): Non-empty Confluence Query Language search string.
+- `limit` (number, optional): Page size; defaults to `25` when omitted.
+- `start` (number, optional): Zero-based starting index; omitted values use Confluence's default.
+- `expand` (string, optional): Comma-separated native search expansions, such as `content.body.storage,content.space`.
+
+The response retains Confluence's paginated `SearchResult` shape: content is nested under `results[].content`, and space results are nested under `results[].space`. It is not flattened into a content array. Use search-specific expansion paths to read nested fields, for example:
+
+```json
+{
+  "cql": "type=page",
+  "limit": 25,
+  "start": 0,
+  "expand": "content.body.storage,content.space"
+}
+```
+
+### `confluence_create_content`
+
+Create a page or blog post with `POST /content`.
+
+**Arguments:**
+- `title` (string, required): Non-empty title.
+- `spaceKey` (string, required): Non-empty key of the destination space.
+- `content` (string, required): Non-empty body in Confluence **storage** format, for example `<p>Hello</p>`; not Markdown.
+- `type` (string, optional): `page` or `blogpost`; omitted or empty values default to `page`.
+- `parentId` (string, optional): Parent content ID, used to set the ancestors for a child page. Omit for standalone content.
+
+### `confluence_update_content`
+
+Fetch current content with `GET /content/{contentId}?expand=body.storage,version,space`, then update with `PUT /content/{contentId}`. Neither request uses pagination.
+
+**Arguments:**
+- `contentId` (string, required): Non-empty content ID; IDs containing `/` or `..` are rejected before a request.
+- `version` (number, optional): Target version, from `1` through `2147483647`; defaults to the current version plus one.
+- `title` (string, optional): Replacement title; omitted or empty values preserve the fetched title.
+- `content` (string, optional): Replacement body in storage format; omitted or empty values preserve the fetched body.
+- `versionComment` (string, optional): Comment for the new version.
+
+The fetched type and space are preserved. Fields being reused must be complete; otherwise the update fails before the PUT. For a preserved page or blog post body, `body.storage.value` must be present and non-null. A fetched empty string is valid and is preserved. Legitimately bodyless content types do not require a storage body.
+
+Without an explicit `version`, the current version must be available and incrementing it must remain within the allowed range. An explicit target version is sent as supplied, even if the fetched version is absent; it is not replaced by the default or forced to match the fetched snapshot. API conflicts are returned as tool errors, with no automatic retry or rebase.
+
+### `confluence_list_spaces`
+
+List or search spaces using `GET /search`, preserving the native paginated search response with space data under `results[].space`.
+
+**Arguments:**
+- `searchText` (string, optional): Search space titles with CQL `title ~ "..."`. Omitted or empty values use `type=space`.
+- `limit` (number, optional): Page size; defaults to `25` when omitted.
+- `start` (number, optional): Zero-based starting index; omitted values use Confluence's default.
+- `expand` (string, optional): Comma-separated native search expansions, such as `space.homepage`.
+
+This tool returns one result page, including when `searchText` is omitted. Advance `start` to retrieve further pages. Searches match titles, not descriptions. Backslashes and quotes are escaped for containment in the CQL string; the `~` operator's Lucene search syntax retains its meaning.
+
+```json
+{
+  "searchText": "Documentation",
+  "limit": 25,
+  "start": 0,
+  "expand": "space.homepage"
+}
+```
+
+## Development and Builds
+
+Use Go 1.25.5 and run checks from the repository root:
 
 ```bash
-# Build for current platform
-go build .
-
-# Build for multiple platforms
-./build.sh
+go vet ./...
+go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+go build -v ./...
 ```
 
-The `build.sh` script creates binaries for:
-- Linux (amd64, arm64)
-- macOS (amd64, arm64)
-- Windows (amd64, arm64)
+Configuration tests isolate `CONFLUENCE_API_TOKEN`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_API_BASE_PATH`, and `CONFLUENCE_HOST`; no production credentials are used. The automated tests use local HTTP fixtures to verify client contracts; they do not establish compatibility against a live Confluence installation.
 
-### Building with older Go versions
-
-If you are using an older version of Go (e.g., 1.24) and cannot upgrade, you can modify the `go.mod` file:
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/anudeepd/atlassian-confluence-dc-go-mcp.git
-   cd atlassian-confluence-dc-go-mcp
-   ```
-
-2. Edit the Go version in `go.mod`:
-   ```bash
-   go mod edit -go=1.24
-   ```
-
-3. Tidy the modules:
-   ```bash
-   go mod tidy
-   ```
-
-4. Build the project:
-   ```bash
-   go build .
-   ```
+Local builds use `go build`. GitHub Actions runs tests and lint plus a six-target build matrix; the release workflow publishes the six platform builds for version tags matching `v*.*.*`.
 
 ## Project Structure
 
-```
+```text
 .
-├── main.go           # Main server implementation
-├── main_test.go      # Comprehensive test suite
-├── go.mod            # Go module dependencies
-├── go.sum            # Dependency checksums
-├── build.sh          # Multi-platform build script
-└── README.md         # This file
+├── main.go                       # Server, tool handlers, and REST client
+├── main_test.go                  # Client and handler contract tests
+├── go.mod                        # Go module and dependency versions
+├── go.sum                        # Dependency checksums
+├── .github/workflows/ci.yml      # Test, lint, and six-target build checks
+├── .github/workflows/release.yml # Cross-platform release builds
+├── LICENSE                       # MIT license and original copyright
+└── README.md                     # This file
 ```
 
 ## API Reference
 
-### Confluence REST API
+- [Confluence Server REST API 7.9.0](https://docs.atlassian.com/ConfluenceServer/rest/7.9.0/) — pinned REST specification for the target version.
+- [Confluence 7.9 release notes](https://confluence.atlassian.com/doc/confluence-7-9-release-notes-1026537698.html) — Server personal access token support.
+- [CQL field reference](https://developer.atlassian.com/server/confluence/cql-field-reference/).
+- [Advanced searching using CQL](https://developer.atlassian.com/server/confluence/advanced-searching-using-cql/).
 
-This server uses the Confluence Data Center REST API v1. For more information about the API endpoints and CQL syntax, see:
+## License and Acknowledgments
 
-- [Confluence REST API Documentation](https://developer.atlassian.com/server/confluence/rest/latest/)
-- [Confluence Query Language (CQL)](https://developer.atlassian.com/server/confluence/advanced-searching-using-cql/)
+This project is licensed under the [MIT License](LICENSE). The original license and copyright are preserved.
 
-## Contributing
+Historical attribution:
+- Upstream Go implementation: [Anudeep Dhavaleswarapu's atlassian-confluence-dc-go-mcp](https://github.com/anudeepd/atlassian-confluence-dc-go-mcp).
+- Original TypeScript implementation that inspired the Go rewrite: [b1ff/atlassian-dc-mcp](https://github.com/b1ff/atlassian-dc-mcp).
+- MCP Go SDK: [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go).
+- [Model Context Protocol](https://modelcontextprotocol.io/).
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+For issues or contributions, use the [canonical GitHub repository](https://github.com/0FL01/confluence-7.9.0-go-mcp).
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+### Upstream release history
 
-## License
+These versions belong to the original upstream module, not to this repository's canonical module or releases. Historical older-Go workarounds are not supported here; use Go 1.25.5.
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- Original TypeScript implementation: [b1ff/atlassian-dc-mcp](https://github.com/b1ff/atlassian-dc-mcp)
-- MCP Go SDK: [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go)
-- Model Context Protocol: [Anthropic MCP](https://modelcontextprotocol.io/)
-
-## Support
-
-For issues, questions, or contributions, please open an issue on GitHub.
-
-## Changelog
-
-### v1.0.2
-- Added documentation for building with older Go versions
-
-### v1.0.1 [Deprecated]
-- Fixed incorrect module path in `go.mod`
-- **Note**: This version is deprecated due to configuration issues. Please use v1.0.2+.
-
-### v1.0.0 (Initial Release) [Deprecated]
-- Complete Go rewrite of the TypeScript implementation
-- Support for all core Confluence operations
-- Multi-platform build support
-- MCP protocol compliance
-- **Note**: This version is deprecated due to incorrect module configuration. Please use v1.0.2+.
+- **v1.0.2:** documented building with older Go versions.
+- **v1.0.1 (deprecated upstream):** fixed the upstream module path; later deprecated for configuration issues.
+- **v1.0.0 (deprecated upstream):** initial Go rewrite, core Confluence tools, multi-platform builds and MCP support; later deprecated for module configuration issues.

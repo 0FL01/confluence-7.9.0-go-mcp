@@ -3,11 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -15,6 +22,7 @@ import (
 
 // TestLoadConfig tests configuration loading from environment variables.
 func TestLoadConfig(t *testing.T) {
+	resetConfigEnv(t)
 	tests := []struct {
 		name    string
 		env     map[string]string
@@ -129,14 +137,17 @@ func TestGetArguments(t *testing.T) {
 	})
 }
 
-// TestNewQueryWithCommonArgs tests mapping MCP arguments to URL query parameters.
-func TestNewQueryWithCommonArgs(t *testing.T) {
+// TestNewPaginatedQuery tests mapping MCP arguments to URL query parameters.
+func TestNewPaginatedQuery(t *testing.T) {
 	args := map[string]any{
 		"limit":  float64(10),
 		"start":  float64(5),
 		"expand": "body.storage",
 	}
-	query := newQueryWithCommonArgs(args)
+	query, err := newPaginatedQuery(args)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if query.Get("limit") != "10" {
 		t.Errorf("expected limit 10, got %s", query.Get("limit"))
@@ -156,8 +167,8 @@ func TestHandleGetContent(t *testing.T) {
 		if r.URL.Path != "/rest/api/content/123" {
 			t.Errorf("expected path /rest/api/content/123, got %s", r.URL.Path)
 		}
-		if !strings.Contains(r.URL.RawQuery, "expand=body.storage") {
-			t.Errorf("expected expand=body.storage in query, got %s", r.URL.RawQuery)
+		if r.Method != http.MethodGet || !reflect.DeepEqual(r.URL.Query(), url.Values{"expand": {"body.storage"}}) {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -206,7 +217,8 @@ func TestHandleGetContent(t *testing.T) {
 				Arguments: map[string]any{},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for missing contentId")
 		}
@@ -221,7 +233,8 @@ func TestHandleGetContent(t *testing.T) {
 				},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for invalid contentId format")
 		}
@@ -236,7 +249,8 @@ func TestHandleGetContent(t *testing.T) {
 
 		errClient := NewConfluenceClient(&ConfluenceConfig{BaseURL: errServer.URL, Token: "token"})
 		errHandler := handleGetContent(errClient)
-		result, _ := errHandler(ctx, req)
+		result, err := errHandler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for API 404")
 		}
@@ -267,7 +281,7 @@ func TestHandleListSpaces(t *testing.T) {
 	handler := handleListSpaces(client)
 	ctx := context.Background()
 
-	t.Run("list all spaces", func(t *testing.T) {
+	t.Run("list first page", func(t *testing.T) {
 		req := mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
 				Name:      "confluence_list_spaces",
@@ -339,7 +353,9 @@ func TestHandleCreateContent(t *testing.T) {
 		}
 		var page ConfluencePage
 		if err := json.NewDecoder(r.Body).Decode(&page); err != nil {
-			t.Fatalf("failed to decode request body: %v", err)
+			t.Errorf("failed to decode request body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 		if page.Title != "New Page" {
 			t.Errorf("expected title New Page, got %s", page.Title)
@@ -380,13 +396,15 @@ func TestHandleUpdateContent(t *testing.T) {
 		if r.Method == "GET" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"id":"123","title":"Old Title","version":{"number":1}}`))
+			_, _ = w.Write([]byte(`{"id":"123","type":"page","title":"Old Title","space":{"key":"TS"},"body":{"storage":{"value":"<p>Old</p>","representation":"storage"}},"version":{"number":1}}`))
 			return
 		}
 		if r.Method == "PUT" {
 			var page ConfluencePage
 			if err := json.NewDecoder(r.Body).Decode(&page); err != nil {
-				t.Fatalf("failed to decode request body: %v", err)
+				t.Errorf("failed to decode request body: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
 			}
 			if page.Version.Number != 2 {
 				t.Errorf("expected version 2, got %d", page.Version.Number)
@@ -435,7 +453,8 @@ func TestHandleSearchContentErrors(t *testing.T) {
 				Arguments: map[string]any{},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for missing cql")
 		}
@@ -455,7 +474,8 @@ func TestHandleCreateContentErrors(t *testing.T) {
 				Arguments: map[string]any{},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for missing title")
 		}
@@ -475,7 +495,8 @@ func TestHandleUpdateContentErrors(t *testing.T) {
 				Arguments: map[string]any{},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for missing contentId")
 		}
@@ -559,6 +580,7 @@ func TestDoRequestAPIError(t *testing.T) {
 
 // TestLoadConfigMore covers additional paths in loadConfig.
 func TestLoadConfigMore(t *testing.T) {
+	resetConfigEnv(t)
 	t.Run("valid config with CONFLUENCE_API_BASE_PATH", func(t *testing.T) {
 		t.Setenv("CONFLUENCE_API_TOKEN", "test-token")
 		t.Setenv("CONFLUENCE_API_BASE_PATH", "https://example.com/wiki")
@@ -605,7 +627,7 @@ func TestHandleCreateContentMore(t *testing.T) {
 					"title":    "Child Page",
 					"spaceKey": "TEST",
 					"content":  "content",
-					"type":     "blogpost",
+					"type":     "page",
 					"parentId": "123",
 				},
 			},
@@ -614,8 +636,8 @@ func TestHandleCreateContentMore(t *testing.T) {
 		if err != nil || result.IsError {
 			t.Fatalf("handler failed: %v, %v", err, result)
 		}
-		if !strings.Contains(result.Content[0].(mcp.TextContent).Text, `"type":"blogpost"`) {
-			t.Error("expected blogpost type in result")
+		if !strings.Contains(result.Content[0].(mcp.TextContent).Text, `"type":"page"`) {
+			t.Error("expected page type in result")
 		}
 		if !strings.Contains(result.Content[0].(mcp.TextContent).Text, `"ancestors":[{"id":"123"}]`) {
 			t.Error("expected ancestors in result")
@@ -628,7 +650,8 @@ func TestHandleCreateContentMore(t *testing.T) {
 				Arguments: "invalid",
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for invalid arguments")
 		}
@@ -642,13 +665,7 @@ func TestHandleUpdateContentMore(t *testing.T) {
 	t.Run("update with explicit version and versions comment", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == "GET" {
-				_ = json.NewEncoder(w).Encode(ConfluencePage{
-					ID:    "123",
-					Title: "Old",
-					Type:  "page",
-					Space: &SpaceRef{Key: "TS"},
-					Body:  &Body{Storage: &BodyStorage{Value: "old content"}},
-				})
+				_, _ = w.Write([]byte(`{"id":"123","type":"page","title":"Old","space":{"key":"TS"},"body":{"storage":{"value":"old content","representation":"storage"}}}`))
 				return
 			}
 			var page ConfluencePage
@@ -684,12 +701,7 @@ func TestHandleUpdateContentMore(t *testing.T) {
 	t.Run("update without new title/content (use current)", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == "GET" {
-				_ = json.NewEncoder(w).Encode(ConfluencePage{
-					ID:      "123",
-					Title:   "Current Title",
-					Version: &Version{Number: 1},
-					Body:    &Body{Storage: &BodyStorage{Value: "Current Content"}},
-				})
+				_, _ = w.Write([]byte(`{"id":"123","type":"page","title":"Current Title","space":{"key":"TS"},"version":{"number":1},"body":{"storage":{"value":"Current Content","representation":"storage"}}}`))
 				return
 			}
 			var page ConfluencePage
@@ -710,7 +722,10 @@ func TestHandleUpdateContentMore(t *testing.T) {
 				},
 			},
 		}
-		_, _ = handler(ctx, req)
+		result, err := handler(ctx, req)
+		if err != nil || result.IsError {
+			t.Fatalf("handler failed: %v, %v", err, result)
+		}
 	})
 
 	t.Run("missing current version error", func(t *testing.T) {
@@ -726,7 +741,8 @@ func TestHandleUpdateContentMore(t *testing.T) {
 				Arguments: map[string]any{"contentId": "123"},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError || !strings.Contains(result.Content[0].(mcp.TextContent).Text, "could not determine current version") {
 			t.Error("expected version error")
 		}
@@ -740,7 +756,8 @@ func TestHandleUpdateContentMore(t *testing.T) {
 				Arguments: map[string]any{"contentId": "../bad"},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for bad contentId")
 		}
@@ -754,7 +771,8 @@ func TestHandleUpdateContentMore(t *testing.T) {
 				Arguments: "invalid",
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for invalid arguments")
 		}
@@ -783,7 +801,10 @@ func TestHandleListSpacesMore(t *testing.T) {
 				Arguments: map[string]any{"searchText": `a "quoted" word`},
 			},
 		}
-		_, _ = handler(ctx, req)
+		result, err := handler(ctx, req)
+		if err != nil || result.IsError {
+			t.Fatalf("handler failed: %v, %v", err, result)
+		}
 	})
 
 	t.Run("getArguments failure", func(t *testing.T) {
@@ -794,7 +815,8 @@ func TestHandleListSpacesMore(t *testing.T) {
 				Arguments: "invalid",
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for invalid arguments")
 		}
@@ -813,7 +835,8 @@ func TestHandleGetContentMore(t *testing.T) {
 				Arguments: "invalid",
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for invalid arguments")
 		}
@@ -832,7 +855,8 @@ func TestHandleSearchContentMore(t *testing.T) {
 				Arguments: "invalid",
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for invalid arguments")
 		}
@@ -851,7 +875,8 @@ func TestHandleCreateContentMissingArgs(t *testing.T) {
 				Arguments: map[string]any{"title": "T", "content": "C"},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError || !strings.Contains(result.Content[0].(mcp.TextContent).Text, "spaceKey is required") {
 			t.Error("expected spaceKey error")
 		}
@@ -863,7 +888,8 @@ func TestHandleCreateContentMissingArgs(t *testing.T) {
 				Arguments: map[string]any{"title": "T", "spaceKey": "S"},
 			},
 		}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError || !strings.Contains(result.Content[0].(mcp.TextContent).Text, "content is required") {
 			t.Error("expected content error")
 		}
@@ -875,11 +901,14 @@ func TestTransportErrors(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("executeRequest connection failure", func(t *testing.T) {
-		// Use an invalid address to trigger connection failure
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://invalid.local", Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Token: "t"})
+		failure := errors.New("connection failure")
+		client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, failure
+		})
 		_, err := client.executeRequest(ctx, "GET", "/", nil, nil)
-		if err == nil {
-			t.Error("expected error for connection failure")
+		if !errors.Is(err, failure) {
+			t.Errorf("expected connection failure, got %v", err)
 		}
 	})
 
@@ -896,23 +925,16 @@ func TestTransportErrors(t *testing.T) {
 // TestHandlerAPIErrors covers where handlers receive errors from the client.
 func TestHandlerAPIErrors(t *testing.T) {
 	ctx := context.Background()
-	// A server that just closes the connection
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			t.Fatal("webserver doesn't support hijacking")
-		}
-		conn, _, _ := hj.Hijack()
-		_ = conn.Close()
-	}))
-	defer server.Close()
-
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Token: "t"})
+	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection failure")
+	})
 
 	t.Run("handleSearchContent error", func(t *testing.T) {
 		handler := handleSearchContent(client)
 		req := mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"cql": "cql"}}}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for connection close")
 		}
@@ -921,7 +943,8 @@ func TestHandlerAPIErrors(t *testing.T) {
 	t.Run("handleCreateContent error", func(t *testing.T) {
 		handler := handleCreateContent(client)
 		req := mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"title": "T", "spaceKey": "S", "content": "C"}}}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for connection close")
 		}
@@ -930,7 +953,8 @@ func TestHandlerAPIErrors(t *testing.T) {
 	t.Run("handleUpdateContent error", func(t *testing.T) {
 		handler := handleUpdateContent(client)
 		req := mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123"}}}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for connection close")
 		}
@@ -939,7 +963,8 @@ func TestHandlerAPIErrors(t *testing.T) {
 	t.Run("handleListSpaces error", func(t *testing.T) {
 		handler := handleListSpaces(client)
 		req := mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{}}}
-		result, _ := handler(ctx, req)
+		result, err := handler(ctx, req)
+		assertToolError(t, result, err)
 		if !result.IsError {
 			t.Error("expected error for connection close")
 		}
@@ -952,12 +977,7 @@ func TestHandleUpdateContentPutError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(ConfluencePage{
-				ID:      "123",
-				Title:   "Old",
-				Type:    "page",
-				Version: &Version{Number: 1},
-			})
+			_, _ = w.Write([]byte(`{"id":"123","title":"Old","type":"page","space":{"key":"TS"},"body":{"storage":{"value":"<p>Old</p>","representation":"storage"}},"version":{"number":1}}`))
 			return
 		}
 		// PUT fails
@@ -973,7 +993,8 @@ func TestHandleUpdateContentPutError(t *testing.T) {
 			Arguments: map[string]any{"contentId": "123"},
 		},
 	}
-	result, _ := handler(ctx, req)
+	result, err := handler(ctx, req)
+	assertToolError(t, result, err)
 	if !result.IsError || !strings.Contains(result.Content[0].(mcp.TextContent).Text, "error updating content") {
 		t.Errorf("expected update error, got %v", result.Content)
 	}
@@ -985,6 +1006,67 @@ func TestSetupServer(t *testing.T) {
 	s := setupServer(client)
 	if s == nil {
 		t.Fatal("setupServer returned nil")
+	}
+	expected := map[string][]string{
+		"confluence_get_content":    {"contentId", "expand"},
+		"confluence_search_content": {"cql", "limit", "start", "expand"},
+		"confluence_create_content": {"title", "spaceKey", "content", "type", "parentId"},
+		"confluence_update_content": {"contentId", "version", "title", "content", "versionComment"},
+		"confluence_list_spaces":    {"searchText", "limit", "start", "expand"},
+	}
+	required := map[string][]string{
+		"confluence_get_content": {"contentId"}, "confluence_search_content": {"cql"},
+		"confluence_create_content": {"title", "spaceKey", "content"}, "confluence_update_content": {"contentId"},
+	}
+	tools := s.ListTools()
+	if len(tools) != len(expected) {
+		t.Fatalf("unexpected tool count %d", len(tools))
+	}
+	for name, args := range expected {
+		tool := tools[name]
+		if tool == nil {
+			t.Fatalf("missing tool %s", name)
+		}
+		if !strings.Contains(tool.Tool.Description, "7.9.0 Server") || strings.Contains(tool.Tool.Description, "Data Center") {
+			t.Errorf("wrong target description: %s", tool.Tool.Description)
+		}
+		properties := tool.Tool.InputSchema.Properties
+		if len(properties) != len(args) {
+			t.Errorf("%s properties: %v", name, properties)
+		}
+		for _, arg := range args {
+			if _, ok := properties[arg]; !ok {
+				t.Errorf("%s missing argument %s", name, arg)
+			}
+		}
+		if !slices.Equal(tool.Tool.InputSchema.Required, required[name]) {
+			t.Errorf("%s required: %v", name, tool.Tool.InputSchema.Required)
+		}
+		for _, arg := range []string{"limit", "start", "version"} {
+			if property, ok := properties[arg]; ok {
+				min := float64(0)
+				if arg == "version" {
+					min = 1
+				}
+				p := property.(map[string]any)
+				if p["type"] != "number" || p["minimum"] != min || p["maximum"] != float64(maxRESTInt) || p["multipleOf"] != float64(1) {
+					t.Errorf("%s.%s numeric constraints: %v", name, arg, p)
+				}
+			}
+		}
+	}
+	typeProperty := tools["confluence_create_content"].Tool.InputSchema.Properties["type"].(map[string]any)
+	if !reflect.DeepEqual(typeProperty["enum"], []string{"", "page", "blogpost"}) {
+		t.Errorf("create type enum: %v", typeProperty)
+	}
+	response := s.HandleMessage(context.Background(), json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`))
+	rpc, ok := response.(mcp.JSONRPCResponse)
+	if !ok {
+		t.Fatalf("initialize response: %T %v", response, response)
+	}
+	initialized, ok := rpc.Result.(mcp.InitializeResult)
+	if !ok || initialized.ServerInfo.Name != "confluence-7.9.0-go-mcp" || initialized.ServerInfo.Version != "1.0.0" {
+		t.Fatalf("initialize result: %v", rpc.Result)
 	}
 }
 
@@ -1008,6 +1090,7 @@ func TestDoRequestReadError(t *testing.T) {
 
 // TestRun tests the run function.
 func TestRun(t *testing.T) {
+	resetConfigEnv(t)
 	t.Run("success", func(t *testing.T) {
 		t.Setenv("CONFLUENCE_API_TOKEN", "token")
 		t.Setenv("CONFLUENCE_BASE_URL", "http://localhost")
@@ -1039,4 +1122,459 @@ func TestRun(t *testing.T) {
 			t.Errorf("expected serve error, got %v", err)
 		}
 	})
+}
+
+func resetConfigEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{"CONFLUENCE_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_API_BASE_PATH", "CONFLUENCE_HOST"} {
+		t.Setenv(name, "")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func assertToolError(t *testing.T, result *mcp.CallToolResult, err error) {
+	t.Helper()
+	if err != nil || result == nil || !result.IsError {
+		t.Fatalf("expected tool-error + nil, got %v, %v", result, err)
+	}
+}
+
+func assertToolText(t *testing.T, result *mcp.CallToolResult, err error, want string) {
+	t.Helper()
+	if err != nil || result == nil || result.IsError || len(result.Content) != 1 {
+		t.Fatalf("expected successful text result, got %v, %v", result, err)
+	}
+	text, ok := result.Content[0].(mcp.TextContent)
+	if !ok || text.Text != want {
+		t.Fatalf("response changed: %v, want %q", result.Content, want)
+	}
+}
+
+func TestLoadConfigServerContract(t *testing.T) {
+	cases := []struct {
+		name, input, want string
+	}{
+		{"host", "example.test", "https://example.test/rest/api"},
+		{"context", "http://example.test:8090/confluence/", "http://example.test:8090/confluence/rest/api"},
+		{"REST root", "https://example.test/confluence/rest/api///", "https://example.test/confluence/rest/api"},
+		{"suffix not substring", "https://example.test/rest/api-context", "https://example.test/rest/api-context/rest/api"},
+		{"escaped context", "https://example.test/my%20wiki/", "https://example.test/my%20wiki/rest/api"},
+		{"wrong scheme", "httpx://example.test", ""},
+		{"missing host", "https:///confluence", ""},
+		{"empty hostname", "http://:8090", ""},
+		{"query", "https://example.test?status=draft", ""},
+		{"empty query", "https://example.test?", ""},
+		{"fragment", "https://example.test#fragment", ""},
+		{"empty fragment", "https://example.test#", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetConfigEnv(t)
+			t.Setenv("CONFLUENCE_API_TOKEN", "test-token")
+			t.Setenv("CONFLUENCE_BASE_URL", tc.input)
+			config, err := loadConfig()
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("accepted invalid URL: %s", tc.input)
+				}
+			} else if err != nil || config.BaseURL != tc.want || config.Token != "test-token" {
+				t.Fatalf("config %v, %v; want %s", config, err, tc.want)
+			}
+		})
+	}
+	t.Run("precedence", func(t *testing.T) {
+		resetConfigEnv(t)
+		t.Setenv("CONFLUENCE_API_TOKEN", "test-token")
+		t.Setenv("CONFLUENCE_BASE_URL", "https://base.test/wiki")
+		t.Setenv("CONFLUENCE_API_BASE_PATH", "https://api.test/wiki")
+		t.Setenv("CONFLUENCE_HOST", "host.test")
+		for _, tc := range []struct{ clear, want string }{
+			{"", "https://base.test/wiki/rest/api"},
+			{"CONFLUENCE_BASE_URL", "https://api.test/wiki/rest/api"},
+			{"CONFLUENCE_API_BASE_PATH", "https://host.test/rest/api"},
+		} {
+			if tc.clear != "" {
+				t.Setenv(tc.clear, "")
+			}
+			config, err := loadConfig()
+			if err != nil || config.BaseURL != tc.want {
+				t.Fatalf("precedence: %v, %v; want %s", config, err, tc.want)
+			}
+		}
+	})
+}
+
+func TestReadOptionalIntArgument(t *testing.T) {
+	for _, name := range []string{"limit", "start", "version"} {
+		min := 0
+		if name == "version" {
+			min = 1
+		}
+		for _, tc := range []struct {
+			label string
+			value any
+			valid bool
+		}{
+			{"minimum", float64(min), true}, {"maximum", float64(maxRESTInt), true},
+			{"below minimum", float64(min - 1), false}, {"overflow", float64(maxRESTInt) + 1, false},
+			{"fraction", 1.5, false}, {"NaN", math.NaN(), false},
+			{"positive infinity", math.Inf(1), false}, {"negative infinity", math.Inf(-1), false},
+			{"string", "1", false}, {"integer Go type", 1, false}, {"null", nil, false},
+		} {
+			t.Run(name+"/"+tc.label, func(t *testing.T) {
+				value, present, err := readOptionalIntArgument(map[string]any{name: tc.value}, name, min)
+				if !present || (err == nil) != tc.valid {
+					t.Fatalf("value=%d present=%v err=%v", value, present, err)
+				}
+				if tc.valid && float64(value) != tc.value.(float64) {
+					t.Fatalf("changed number: %d, want %v", value, tc.value)
+				}
+			})
+		}
+		if _, present, err := readOptionalIntArgument(nil, name, min); present || err != nil {
+			t.Fatalf("missing %s: present=%v err=%v", name, present, err)
+		}
+	}
+	query, err := newPaginatedQuery(nil)
+	if err != nil || !reflect.DeepEqual(query, url.Values{"limit": {"25"}}) {
+		t.Fatalf("default query: %v, %v", query, err)
+	}
+}
+
+func TestHandleValidationBeforeHTTP(t *testing.T) {
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Token: "test"})
+	calls := 0
+	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, errors.New("unexpected HTTP call")
+	})
+	for _, name := range []string{"confluence_search_content", "confluence_list_spaces"} {
+		for _, key := range []string{"limit", "start"} {
+			for _, value := range []any{-1.0, 1.5, float64(maxRESTInt) + 1, "1", nil} {
+				args := map[string]any{"cql": "type=page", key: value}
+				tool := setupServer(client).GetTool(name)
+				result, err := tool.Handler(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: args}})
+				assertToolError(t, result, err)
+			}
+		}
+	}
+	for _, value := range []any{0.0, 1.5, float64(maxRESTInt) + 1, "1", nil} {
+		result, err := handleUpdateContent(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123", "version": value}}})
+		assertToolError(t, result, err)
+	}
+	for _, value := range []any{"attachment", 1.0, nil} {
+		result, err := handleCreateContent(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"title": "T", "spaceKey": "TS", "content": "<p>C</p>", "type": value}}})
+		assertToolError(t, result, err)
+	}
+	for _, name := range []string{"confluence_get_content", "confluence_update_content"} {
+		for _, id := range []string{"123/456", "..123"} {
+			result, err := setupServer(client).GetTool(name).Handler(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": id}}})
+			assertToolError(t, result, err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("invalid arguments issued %d HTTP calls", calls)
+	}
+}
+
+func TestHandleReadQueries(t *testing.T) {
+	content := `{"id":"123","type":"page","body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}`
+	search := `{"results":[{"content":{"id":"123","type":"page","space":{"key":"TS"},"body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}}],"start":0,"limit":25,"_links":{"next":"/rest/api/search?start=25"}}`
+	spaces := `{"results":[{"space":{"key":"TS","name":"Test","homepage":{"id":"123"}}}],"start":0,"limit":25,"_links":{"base":"http://example.test"}}`
+	for _, tc := range []struct {
+		name, tool, path, response string
+		args                       map[string]any
+		query                      url.Values
+	}{
+		{"get expansion", "confluence_get_content", "/content/123", content, map[string]any{"contentId": "123", "expand": "version", "limit": 10.0, "start": 2.0}, url.Values{"expand": {"version,body.storage"}}},
+		{"get no duplicate", "confluence_get_content", "/content/123", content, map[string]any{"contentId": "123", "expand": "body.storage"}, url.Values{"expand": {"body.storage"}}},
+		{"search", "confluence_search_content", "/search", search, map[string]any{"cql": `title ~ "a\\b"`, "expand": "content.body.storage,content.space"}, url.Values{"cql": {`title ~ "a\\b"`}, "limit": {"25"}, "expand": {"content.body.storage,content.space"}}},
+		{"spaces default", "confluence_list_spaces", "/search", spaces, map[string]any{}, url.Values{"cql": {"type=space"}, "limit": {"25"}}},
+		{"space title", "confluence_list_spaces", "/search", spaces, map[string]any{"searchText": `a\"quoted"*`, "limit": 0.0, "start": 2.0, "expand": "space.homepage"}, url.Values{"cql": {`type=space AND title ~ "a\\\"quoted\"*"`}, "limit": {"0"}, "start": {"2"}, "expand": {"space.homepage"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/confluence/rest/api"+tc.path || !reflect.DeepEqual(r.URL.Query(), tc.query) {
+					t.Errorf("request %s %s; want GET %s %v", r.Method, r.URL, tc.path, tc.query)
+				}
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			defer server.Close()
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/confluence/rest/api", Token: "test"})
+			result, err := setupServer(client).GetTool(tc.tool).Handler(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: tc.args}})
+			assertToolText(t, result, err, tc.response)
+		})
+	}
+}
+
+func TestHandleCreateContentPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantType, parent string
+		typeArg                any
+		setType                bool
+	}{
+		{"default page", "page", "", nil, false},
+		{"empty default", "page", "", "", true},
+		{"child page", "page", "123", "page", true},
+		{"standalone blogpost", "blogpost", "", "blogpost", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := map[string]any{"type": tc.wantType, "title": "New", "space": map[string]any{"key": "TS"}, "body": map[string]any{"storage": map[string]any{"value": "<p>New</p>", "representation": "storage"}}}
+			args := map[string]any{"title": "New", "spaceKey": "TS", "content": "<p>New</p>"}
+			if tc.setType {
+				args["type"] = tc.typeArg
+			}
+			if tc.parent != "" {
+				args["parentId"] = tc.parent
+				want["ancestors"] = []any{map[string]any{"id": tc.parent}}
+			}
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Token: "test"})
+			calls := 0
+			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.Method != http.MethodPost || r.URL.Path != "/rest/api/content" || r.URL.RawQuery != "" {
+					t.Errorf("unexpected create request: %s %s", r.Method, r.URL)
+				}
+				var got map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil || !reflect.DeepEqual(got, want) {
+					t.Errorf("create payload %v, %v; want %v", got, err, want)
+				}
+				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"id":"456"}`))}, nil
+			})
+			result, err := handleCreateContent(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: args}})
+			assertToolText(t, result, err, `{"id":"456"}`)
+			if calls != 1 {
+				t.Fatalf("create calls: %d", calls)
+			}
+		})
+	}
+}
+
+func TestHandleUpdateContentPreservation(t *testing.T) {
+	const currentJSON = `{"id":"123","type":"page","title":"Old","space":{"key":"TS"},"body":{"storage":{"value":"<p>Old</p>","representation":"storage"}},"version":{"number":1}}`
+	for _, tc := range []struct {
+		name                   string
+		args                   map[string]any
+		alter                  func(map[string]any)
+		wantTitle, wantBody    string
+		wantVersion, putStatus int
+		bodyless, wantError    bool
+	}{
+		{name: "preserve omitted"},
+		{name: "preserve empty args", args: map[string]any{"title": "", "content": ""}},
+		{name: "replace title", args: map[string]any{"title": "New"}, wantTitle: "New"},
+		{name: "replace body", args: map[string]any{"content": "<p>New</p>"}, wantBody: "<p>New</p>", alter: func(m map[string]any) { delete(m, "body") }},
+		{name: "replace absent fields", args: map[string]any{"title": "New", "content": "<p>New</p>"}, wantTitle: "New", wantBody: "<p>New</p>", alter: func(m map[string]any) { delete(m, "title"); delete(m, "body") }},
+		{name: "explicit version without current", args: map[string]any{"version": 10.0, "versionComment": "note"}, wantVersion: 10, alter: func(m map[string]any) { delete(m, "version") }},
+		{name: "empty stored body", alter: func(m map[string]any) {
+			m["body"] = map[string]any{"storage": map[string]any{"value": "", "representation": "storage"}}
+		}},
+		{name: "blogpost", alter: func(m map[string]any) { m["type"] = "blogpost" }},
+		{name: "bodyless attachment", bodyless: true, alter: func(m map[string]any) { m["type"] = "attachment"; delete(m, "body") }},
+		{name: "missing type", wantError: true, alter: func(m map[string]any) { delete(m, "type") }},
+		{name: "missing space", wantError: true, alter: func(m map[string]any) { delete(m, "space") }},
+		{name: "empty space key", wantError: true, alter: func(m map[string]any) { m["space"] = map[string]any{"key": ""} }},
+		{name: "missing title", wantError: true, alter: func(m map[string]any) { delete(m, "title") }},
+		{name: "missing storage", wantError: true, alter: func(m map[string]any) { m["body"] = map[string]any{} }},
+		{name: "missing storage value", wantError: true, alter: func(m map[string]any) {
+			m["body"] = map[string]any{"storage": map[string]any{"representation": "storage"}}
+		}},
+		{name: "null storage value", wantError: true, alter: func(m map[string]any) {
+			m["body"] = map[string]any{"storage": map[string]any{"value": nil, "representation": "storage"}}
+		}},
+		{name: "incomplete representation", wantError: true, alter: func(m map[string]any) { m["body"] = map[string]any{"storage": map[string]any{"value": "<p>Old</p>"}} }},
+		{name: "missing version", wantError: true, alter: func(m map[string]any) { delete(m, "version") }},
+		{name: "invalid current version", wantError: true, alter: func(m map[string]any) { m["version"] = map[string]any{"number": 0} }},
+		{name: "increment overflow", wantError: true, alter: func(m map[string]any) { m["version"] = map[string]any{"number": maxRESTInt} }},
+		{name: "conflict", putStatus: http.StatusConflict, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var current map[string]any
+			if err := json.Unmarshal([]byte(currentJSON), &current); err != nil {
+				t.Fatal(err)
+			}
+			if tc.alter != nil {
+				tc.alter(current)
+			}
+			response, err := json.Marshal(current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := map[string]any{"contentId": "123"}
+			for k, v := range tc.args {
+				args[k] = v
+			}
+			wantTitle, wantBody, wantVersion := "Old", "<p>Old</p>", 2
+			if tc.wantTitle != "" {
+				wantTitle = tc.wantTitle
+			}
+			if tc.wantBody != "" {
+				wantBody = tc.wantBody
+			}
+			if tc.name == "empty stored body" {
+				wantBody = ""
+			}
+			if tc.wantVersion != 0 {
+				wantVersion = tc.wantVersion
+			}
+			version := map[string]any{"number": float64(wantVersion)}
+			if tc.name == "explicit version without current" {
+				version["message"] = "note"
+			}
+			want := map[string]any{"id": "123", "type": current["type"], "title": wantTitle, "space": map[string]any{"key": "TS"}, "version": version}
+			if !tc.bodyless {
+				want["body"] = map[string]any{"storage": map[string]any{"value": wantBody, "representation": "storage"}}
+			}
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Token: "test"})
+			var methods []string // Controlled transport runs synchronously in the test goroutine.
+			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				methods = append(methods, r.Method)
+				if r.URL.Path != "/rest/api/content/123" {
+					t.Errorf("unexpected path: %s", r.URL)
+				}
+				if r.Method == http.MethodGet {
+					if !reflect.DeepEqual(r.URL.Query(), url.Values{"expand": {"body.storage,version,space"}}) {
+						t.Errorf("unexpected update GET query: %s", r.URL)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(response)))}, nil
+				}
+				if r.Method != http.MethodPut || r.URL.RawQuery != "" {
+					t.Errorf("unexpected write request: %s %s", r.Method, r.URL)
+				}
+				var got map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil || !reflect.DeepEqual(got, want) {
+					t.Errorf("update payload: %v, %v; want %v", got, err, want)
+				}
+				status := http.StatusOK
+				if tc.putStatus != 0 {
+					status = tc.putStatus
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"id":"123"}`))}, nil
+			})
+			result, err := handleUpdateContent(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: args}})
+			if tc.wantError {
+				assertToolError(t, result, err)
+			} else {
+				assertToolText(t, result, err, `{"id":"123"}`)
+			}
+			wantMethods := []string{http.MethodGet, http.MethodPut}
+			if tc.wantError && tc.putStatus == 0 {
+				wantMethods = []string{http.MethodGet}
+			}
+			if !slices.Equal(methods, wantMethods) {
+				t.Fatalf("request sequence %v, want %v", methods, wantMethods)
+			}
+		})
+	}
+}
+
+type trackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func TestHandleUpdateContentGetFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload string
+		status        int
+	}{
+		{"API failure", `{"message":"not found"}`, http.StatusNotFound},
+		{"invalid JSON", `{invalid}`, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Token: "test"})
+			calls := 0
+			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.Method != http.MethodGet {
+					t.Errorf("must not PUT after failed GET: %s", r.Method)
+				}
+				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.payload))}, nil
+			})
+			result, err := handleUpdateContent(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123"}}})
+			assertToolError(t, result, err)
+			if calls != 1 {
+				t.Fatalf("GET failure issued %d requests", calls)
+			}
+		})
+	}
+}
+
+func (b *trackingBody) Close() error { b.closed = true; return nil }
+
+func TestExecuteRequestContract(t *testing.T) {
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/confluence/rest/api", Token: "test-token"})
+	if client.httpClient.Timeout != 30*time.Second {
+		t.Fatalf("timeout: %v", client.httpClient.Timeout)
+	}
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "marker")
+	body := &trackingBody{Reader: strings.NewReader(`{}`)}
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.String() != "https://example.test/confluence/rest/api/content?expand=space" || r.Context().Value(contextKey{}) != "marker" {
+			t.Errorf("request/context changed: %s %s", r.Method, r.URL)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" {
+			t.Errorf("headers: %v", r.Header)
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil || string(data) != `{"type":"page"}` {
+			t.Errorf("body: %s, %v", data, err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+	})
+	response, err := client.executeRequest(ctx, http.MethodPost, "/content", url.Values{"expand": {"space"}}, map[string]string{"type": "page"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body.closed {
+		t.Fatal("executeRequest must transfer body ownership to its caller")
+	}
+	_ = response.Body.Close()
+	if !body.closed {
+		t.Fatal("caller did not close body")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, r.Context().Err()
+	})
+	if _, err := client.executeRequest(ctx, http.MethodGet, "/content/123", nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost: %v", err)
+	}
+}
+
+func TestResponseBodyClosure(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload string
+		status        int
+		decode, fail  bool
+	}{
+		{"raw success", `{}`, http.StatusOK, false, false},
+		{"raw API error", `{}`, http.StatusForbidden, false, true},
+		{"JSON success", `{}`, http.StatusOK, true, false},
+		{"JSON API error", `{}`, http.StatusForbidden, true, true},
+		{"JSON decode error", `{invalid}`, http.StatusOK, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &trackingBody{Reader: strings.NewReader(tc.payload)}
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Token: "test"})
+			client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Body: body}, nil
+			})
+			var err error
+			if tc.decode {
+				var target map[string]any
+				err = client.getJSON(context.Background(), "/", nil, &target)
+			} else {
+				_, err = client.doRequest(context.Background(), http.MethodGet, "/", nil, nil)
+			}
+			if (err != nil) != tc.fail || !body.closed {
+				t.Fatalf("err=%v closed=%v", err, body.closed)
+			}
+		})
+	}
 }

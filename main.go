@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +26,7 @@ type ConfluenceConfig struct {
 const (
 	// defaultLimit is the default number of results for paginated requests.
 	defaultLimit = 25
+	maxRESTInt   = 1<<31 - 1
 )
 
 // loadConfig loads configuration from environment variables.
@@ -43,7 +45,10 @@ func loadConfig() (*ConfluenceConfig, error) {
 	}
 
 	if rawURL == "" {
-		return nil, fmt.Errorf("CONFLUENCE_BASE_URL (or CONFLUENCE_HOST) environment variable is required")
+		return nil, fmt.Errorf("CONFLUENCE_BASE_URL, CONFLUENCE_API_BASE_PATH or CONFLUENCE_HOST environment variable is required")
+	}
+	if strings.ContainsAny(rawURL, "?#") {
+		return nil, fmt.Errorf("base URL must not contain a query or fragment")
 	}
 
 	if !strings.Contains(rawURL, "://") {
@@ -55,12 +60,17 @@ func loadConfig() (*ConfluenceConfig, error) {
 		return nil, fmt.Errorf("invalid base URL: %w", err)
 	}
 
-	if !strings.HasPrefix(u.Scheme, "http") {
+	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("base URL must use http or https scheme")
 	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("base URL must have a hostname")
+	}
 
-	if !strings.Contains(u.Path, "/rest/api") {
-		u.Path = strings.TrimSuffix(u.Path, "/") + "/rest/api"
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.RawPath = strings.TrimRight(u.RawPath, "/")
+	if !strings.HasSuffix(u.Path, "/rest/api") {
+		u = u.JoinPath("rest/api")
 	}
 
 	return &ConfluenceConfig{
@@ -126,7 +136,7 @@ func (c *ConfluenceClient) executeRequest(ctx context.Context, method, path stri
 }
 
 // doRequest performs an authenticated HTTP request and returns the body as bytes.
-// It handles basic error checking and limits the response size.
+// It handles basic error checking; successful response bytes are returned unchanged.
 func (c *ConfluenceClient) doRequest(ctx context.Context, method, path string, query url.Values, body any) ([]byte, error) {
 	resp, err := c.executeRequest(ctx, method, path, query, body)
 	if err != nil {
@@ -178,6 +188,25 @@ type SpaceRef struct {
 type BodyStorage struct {
 	Value          string `json:"value"`
 	Representation string `json:"representation"`
+	valuePresent   bool
+}
+
+// UnmarshalJSON distinguishes a valid empty body from an absent/null storage value.
+func (s *BodyStorage) UnmarshalJSON(data []byte) error {
+	var storage struct {
+		Value          *string `json:"value"`
+		Representation string  `json:"representation"`
+	}
+	if err := json.Unmarshal(data, &storage); err != nil {
+		return err
+	}
+	s.Value = ""
+	s.valuePresent = storage.Value != nil
+	if storage.Value != nil {
+		s.Value = *storage.Value
+	}
+	s.Representation = storage.Representation
+	return nil
 }
 
 // Body represents the body of a Confluence page, typically containing storage format.
@@ -233,21 +262,41 @@ func ensureExpand(current, required string) string {
 	return current + "," + required
 }
 
-// newQueryWithCommonArgs helper creates a url.Values object and populates it with common pagination and expansion parameters.
-func newQueryWithCommonArgs(args map[string]any) url.Values {
-	query := url.Values{}
-	if limit, ok := args["limit"].(float64); ok {
-		query.Set("limit", fmt.Sprintf("%d", int(limit)))
-	} else {
-		query.Set("limit", fmt.Sprintf("%d", defaultLimit))
+// readOptionalIntArgument validates MCP JSON numbers before converting to REST ints.
+func readOptionalIntArgument(args map[string]any, name string, min int) (int, bool, error) {
+	raw, present := args[name]
+	if !present {
+		return 0, false, nil
 	}
-	if start, ok := args["start"].(float64); ok {
-		query.Set("start", fmt.Sprintf("%d", int(start)))
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value || value < float64(min) || value > maxRESTInt {
+		return 0, true, fmt.Errorf("%s must be an integer between %d and %d", name, min, maxRESTInt)
+	}
+	return int(value), true, nil
+}
+
+// newPaginatedQuery is only used for the paginated /search endpoint.
+func newPaginatedQuery(args map[string]any) (url.Values, error) {
+	query := url.Values{}
+	limit, present, err := readOptionalIntArgument(args, "limit", 0)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
+		limit = defaultLimit
+	}
+	query.Set("limit", fmt.Sprintf("%d", limit))
+	start, present, err := readOptionalIntArgument(args, "start", 0)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		query.Set("start", fmt.Sprintf("%d", start))
 	}
 	if expand, ok := args["expand"].(string); ok && expand != "" {
 		query.Set("expand", expand)
 	}
-	return query
+	return query, nil
 }
 
 // handleGetContent returns a tool handler for retrieving Confluence content by ID.
@@ -267,8 +316,8 @@ func handleGetContent(client *ConfluenceClient) func(context.Context, mcp.CallTo
 			return mcp.NewToolResultError("invalid contentId format"), nil
 		}
 
-		query := newQueryWithCommonArgs(args)
-		query.Set("expand", ensureExpand(query.Get("expand"), "body.storage"))
+		expand, _ := args["expand"].(string)
+		query := url.Values{"expand": {ensureExpand(expand, "body.storage")}}
 
 		resp, err := client.doRequest(ctx, "GET", "/content/"+contentID, query, nil)
 		if err != nil {
@@ -292,7 +341,10 @@ func handleSearchContent(client *ConfluenceClient) func(context.Context, mcp.Cal
 			return mcp.NewToolResultError("cql must be a string and is required"), nil
 		}
 
-		query := newQueryWithCommonArgs(args)
+		query, err := newPaginatedQuery(args)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		query.Set("cql", cql)
 
 		resp, err := client.doRequest(ctx, "GET", "/search", query, nil)
@@ -325,9 +377,15 @@ func handleCreateContent(client *ConfluenceClient) func(context.Context, mcp.Cal
 			return mcp.NewToolResultError("content is required"), nil
 		}
 
-		typeStr, ok := args["type"].(string)
-		if !ok || typeStr == "" {
-			typeStr = "page"
+		typeStr := "page"
+		if rawType, present := args["type"]; present {
+			value, ok := rawType.(string)
+			if !ok || (value != "" && value != "page" && value != "blogpost") {
+				return mcp.NewToolResultError("type must be page or blogpost (empty defaults to page)"), nil
+			}
+			if value != "" {
+				typeStr = value
+			}
 		}
 
 		parentID, _ := args["parentId"].(string)
@@ -374,19 +432,22 @@ func handleUpdateContent(client *ConfluenceClient) func(context.Context, mcp.Cal
 			return mcp.NewToolResultError("invalid contentId format"), nil
 		}
 
-		query := newQueryWithCommonArgs(args)
-		query.Set("expand", "body.storage,version,space")
+		newVersion, explicitVersion, err := readOptionalIntArgument(args, "version", 1)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		query := url.Values{"expand": {"body.storage,version,space"}}
 		var currentData ConfluencePage
 		if err := client.getJSON(ctx, "/content/"+contentID, query, &currentData); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("failed to retrieve current content: %v", err)), nil
 		}
 
-		var newVersion int
-		if v, ok := args["version"].(float64); ok {
-			newVersion = int(v)
-		} else {
+		if !explicitVersion {
 			if currentData.Version == nil {
 				return mcp.NewToolResultError("could not determine current version from API response"), nil
+			}
+			if currentData.Version.Number < 1 || currentData.Version.Number >= maxRESTInt {
+				return mcp.NewToolResultError("current version cannot be incremented within the REST integer range"), nil
 			}
 			newVersion = currentData.Version.Number + 1
 		}
@@ -394,6 +455,22 @@ func handleUpdateContent(client *ConfluenceClient) func(context.Context, mcp.Cal
 		title, _ := args["title"].(string)
 		contentStr, _ := args["content"].(string)
 		versionComment, _ := args["versionComment"].(string)
+		if currentData.Type == "" || currentData.Space == nil || currentData.Space.Key == "" {
+			return mcp.NewToolResultError("current content must include type and space key"), nil
+		}
+		if title == "" && currentData.Title == "" {
+			return mcp.NewToolResultError("current content must include the title being preserved"), nil
+		}
+		if contentStr == "" {
+			bodyBearing := currentData.Type == "page" || currentData.Type == "blogpost" || currentData.Type == "comment"
+			if currentData.Body == nil || currentData.Body.Storage == nil {
+				if bodyBearing {
+					return mcp.NewToolResultError("current content must include the storage body being preserved"), nil
+				}
+			} else if !currentData.Body.Storage.valuePresent || currentData.Body.Storage.Representation != "storage" {
+				return mcp.NewToolResultError("current storage body must include a non-null value and storage representation"), nil
+			}
+		}
 
 		payload := ConfluencePage{
 			ID:    contentID,
@@ -431,6 +508,12 @@ func handleUpdateContent(client *ConfluenceClient) func(context.Context, mcp.Cal
 	}
 }
 
+// escapeCQLString contains a value in a quoted CQL string, retaining text-query semantics.
+func escapeCQLString(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	return strings.ReplaceAll(value, `"`, `\"`)
+}
+
 // handleListSpaces returns a tool handler for listing/searching Confluence spaces.
 func handleListSpaces(client *ConfluenceClient) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -444,10 +527,13 @@ func handleListSpaces(client *ConfluenceClient) func(context.Context, mcp.CallTo
 		if searchText == "" {
 			cql = "type=space"
 		} else {
-			safeSearchText := strings.ReplaceAll(searchText, `"`, `\"`)
+			safeSearchText := escapeCQLString(searchText)
 			cql = fmt.Sprintf(`type=space AND title ~ "%s"`, safeSearchText)
 		}
-		query := newQueryWithCommonArgs(args)
+		query, err := newPaginatedQuery(args)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		query.Set("cql", cql)
 
 		resp, err := client.doRequest(ctx, "GET", "/search", query, nil)
@@ -462,49 +548,49 @@ func handleListSpaces(client *ConfluenceClient) func(context.Context, mcp.CallTo
 // setupServer configures the MCP server and returns it.
 func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 	s := mcpserver.NewMCPServer(
-		"atlassian-confluence-dc-go-mcp",
+		"confluence-7.9.0-go-mcp",
 		"1.0.0",
 		mcpserver.WithToolCapabilities(true),
 	)
 
 	s.AddTool(mcp.NewTool("confluence_get_content",
-		mcp.WithDescription("Get Confluence content by ID from the Confluence Data Center edition instance"),
-		mcp.WithString("contentId", mcp.Required(), mcp.Description("Confluence Data Center content ID")),
+		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted)"),
+		mcp.WithString("contentId", mcp.Required(), mcp.Description("Confluence content ID")),
 		mcp.WithString("expand", mcp.Description("Comma-separated list of properties to expand")),
 	), handleGetContent(client))
 
 	s.AddTool(mcp.NewTool("confluence_search_content",
-		mcp.WithDescription("Search for content in Confluence Data Center edition instance using CQL"),
-		mcp.WithString("cql", mcp.Required(), mcp.Description("Confluence Query Language (CQL) search string for Confluence Data Center")),
-		mcp.WithNumber("limit", mcp.Description("Maximum number of results to return (default: 25)")),
-		mcp.WithNumber("start", mcp.Description("The starting index of the results to return")),
-		mcp.WithString("expand", mcp.Description("Comma-separated list of properties to expand")),
+		mcp.WithDescription("Search Confluence 7.9.0 Server (selfhosted) using CQL; returns native SearchResult JSON"),
+		mcp.WithString("cql", mcp.Required(), mcp.Description("Confluence Query Language (CQL) search string")),
+		mcp.WithNumber("limit", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Maximum number of results (default: 25; zero is passed to Confluence)")),
+		mcp.WithNumber("start", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Zero-based starting index")),
+		mcp.WithString("expand", mcp.Description("Native search expansions, e.g. content.body.storage,content.space")),
 	), handleSearchContent(client))
 
 	s.AddTool(mcp.NewTool("confluence_create_content",
-		mcp.WithDescription("Create new content in Confluence Data Center edition instance"),
+		mcp.WithDescription("Create a page or blogpost in Confluence 7.9.0 Server (selfhosted)"),
 		mcp.WithString("title", mcp.Required(), mcp.Description("The title of the new content")),
 		mcp.WithString("spaceKey", mcp.Required(), mcp.Description("The key of the space where content will be created")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The content of the page in Confluence storage format")),
-		mcp.WithString("type", mcp.Description("The type of content (page or blogpost)")),
-		mcp.WithString("parentId", mcp.Description("The ID of the parent content (optional)")),
+		mcp.WithString("type", mcp.Enum("", "page", "blogpost"), mcp.Description("Content type; omitted or empty defaults to page")),
+		mcp.WithString("parentId", mcp.Description("Parent page ID for a child page (optional)")),
 	), handleCreateContent(client))
 
 	s.AddTool(mcp.NewTool("confluence_update_content",
-		mcp.WithDescription("Update existing content in Confluence Data Center edition instance"),
+		mcp.WithDescription("Update content in Confluence 7.9.0 Server (selfhosted), preserving unchanged fields"),
 		mcp.WithString("contentId", mcp.Required(), mcp.Description("The ID of the content to update")),
-		mcp.WithNumber("version", mcp.Description("The new version number (optional, defaults to current version + 1)")),
-		mcp.WithString("title", mcp.Description("New title for the content")),
-		mcp.WithString("content", mcp.Description("New content in storage format")),
+		mcp.WithNumber("version", mcp.Min(1), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Target version (optional, defaults to current version + 1)")),
+		mcp.WithString("title", mcp.Description("New title; omitted or empty preserves current")),
+		mcp.WithString("content", mcp.Description("New storage body; omitted or empty preserves current")),
 		mcp.WithString("versionComment", mcp.Description("A comment for the new version")),
 	), handleUpdateContent(client))
 
 	s.AddTool(mcp.NewTool("confluence_list_spaces",
-		mcp.WithDescription("List and search for spaces in Confluence Data Center edition instance"),
-		mcp.WithString("searchText", mcp.Description("Text to search for in space names or descriptions (optional, returns all spaces if omitted)")),
-		mcp.WithNumber("limit", mcp.Description("Maximum number of spaces to return")),
-		mcp.WithNumber("start", mcp.Description("The starting index of the results to return")),
-		mcp.WithString("expand", mcp.Description("Comma-separated list of properties to expand")),
+		mcp.WithDescription("List/search space titles in Confluence 7.9.0 Server (selfhosted); returns a page of native SearchResult JSON"),
+		mcp.WithString("searchText", mcp.Description("CQL text search in space titles; omitted or empty lists one result page")),
+		mcp.WithNumber("limit", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Maximum number of spaces (default: 25; zero is passed to Confluence)")),
+		mcp.WithNumber("start", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Zero-based starting index")),
+		mcp.WithString("expand", mcp.Description("Native search expansions, e.g. space.homepage")),
 	), handleListSpaces(client))
 
 	return s

@@ -1,4 +1,4 @@
-module github.com/anudeepd/atlassian-confluence-dc-go-mcp
+module github.com/0FL01/confluence-7.9.0-go-mcp
 
 go 1.25.5
 
@@ -14,9 +14,4 @@ require (
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-)
-
-retract (
-	v1.0.1 // Incorrect module path
-	v1.0.0 // Incorrect module configuration
 )
