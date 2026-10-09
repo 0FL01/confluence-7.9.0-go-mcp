@@ -6,7 +6,7 @@
 
 A stdio Model Context Protocol (MCP) server for **self-hosted Atlassian Confluence Server 7.9.0**. It lets MCP clients retrieve and search content, create pages and blog posts, update content, and list or search spaces. Data Center and Cloud are not compatibility targets.
 
-The canonical repository and Go module are [`github.com/0FL01/confluence-7.9.0-go-mcp`](https://github.com/0FL01/confluence-7.9.0-go-mcp). The MCP server name is `confluence-7.9.0-go-mcp`, and its application version is `1.0.0`.
+The executable is named `confluence-mcp`. The canonical repository and Go module are [`github.com/0FL01/confluence-7.9.0-go-mcp`](https://github.com/0FL01/confluence-7.9.0-go-mcp). The MCP server name is `confluence-7.9.0-go-mcp`, and its application version is `1.0.0`.
 
 ## Installation and MCP Configuration
 
@@ -17,26 +17,44 @@ Source builds are the primary installation method. Use **Go 1.25.5**, the versio
 ```bash
 git clone https://github.com/0FL01/confluence-7.9.0-go-mcp.git
 cd confluence-7.9.0-go-mcp
-go build ./...
+go build -o confluence-mcp .
 ```
 
-This produces `confluence-7.9.0-go-mcp` in the repository root (`confluence-7.9.0-go-mcp.exe` on Windows). Configure your MCP client with the absolute path to that binary:
+This produces `confluence-mcp` in the repository root. On Windows, use `go build -o confluence-mcp.exe .` instead. On Linux or macOS, you can optionally install the binary into `~/.local/bin`:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+install -m 755 confluence-mcp "$HOME/.local/bin/confluence-mcp"
+```
+
+### Private configuration and OpenCode
+
+Create a `.env` file in a private configuration directory, for example `/absolute/path/to/private/confluence-config/.env`, with your Confluence URL and personal access token:
+
+```dotenv
+CONFLUENCE_BASE_URL='https://confluence.example.invalid/confluence'
+CONFLUENCE_API_TOKEN='replace-with-your-server-personal-access-token'
+```
+
+Configure OpenCode with the absolute path to the executable and set `cwd` to that configuration directory:
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "confluence": {
-      "command": "/absolute/path/to/confluence-7.9.0-go-mcp",
-      "env": {
-        "CONFLUENCE_API_TOKEN": "your-server-personal-access-token",
-        "CONFLUENCE_BASE_URL": "https://confluence.example.com/confluence"
-      }
+      "type": "local",
+      "command": ["/absolute/path/confluence-mcp"],
+      "cwd": "/absolute/path/to/private/confluence-config",
+      "timeout": 35000,
+      "enabled": true
     }
   }
 }
 ```
 
-The server communicates over stdio. Standard output is reserved for MCP protocol messages; diagnostics go to standard error. For development, you can also run `go run .` from the repository root with the same environment variables set.
+Replace the executable path with the actual location, such as `/home/your-user/.local/bin/confluence-mcp` after installation. The server automatically reads `.env` from its working directory and verifies authentication before starting MCP stdio. See [Configuration](#configuration) for precedence and startup behavior.
+
+The server communicates over stdio. Standard output is reserved for MCP protocol messages; diagnostics go to standard error. For development, you can also run `go run .` from the repository root with a `.env` there or with the environment variables set.
 
 ### Prebuilt binaries (when available)
 
@@ -44,30 +62,38 @@ No release has been published under the canonical repository yet. Once a release
 
 | Platform | Artifact |
 | --- | --- |
-| Linux amd64 | `confluence-7.9.0-go-mcp-linux-amd64` |
-| Linux arm64 | `confluence-7.9.0-go-mcp-linux-arm64` |
-| macOS amd64 | `confluence-7.9.0-go-mcp-macos-amd64` |
-| macOS arm64 | `confluence-7.9.0-go-mcp-macos-arm64` |
-| Windows amd64 | `confluence-7.9.0-go-mcp-windows-amd64.exe` |
-| Windows arm64 | `confluence-7.9.0-go-mcp-windows-arm64.exe` |
+| Linux amd64 | `confluence-mcp-linux-amd64` |
+| Linux arm64 | `confluence-mcp-linux-arm64` |
+| macOS amd64 | `confluence-mcp-macos-amd64` |
+| macOS arm64 | `confluence-mcp-macos-arm64` |
+| Windows amd64 | `confluence-mcp-windows-amd64.exe` |
+| Windows arm64 | `confluence-mcp-windows-arm64.exe` |
 
 On Linux or macOS, make the downloaded file executable and use its absolute path as the MCP command. For example, for a future Linux amd64 release:
 
 ```bash
-chmod +x confluence-7.9.0-go-mcp-linux-amd64
+chmod +x confluence-mcp-linux-amd64
 ```
 
 ## Configuration
 
 `CONFLUENCE_API_TOKEN` is required. It must be a **personal access token from Confluence Server 7.9.0**, sent as `Authorization: Bearer <token>`. A Confluence Cloud API token is not the authentication method used here.
 
-Set at least one URL variable. The first non-empty value wins in this order:
+### `.env` and inherited environment
+
+The server reads only `.env` in its current working directory using `godotenv.Read` from `github.com/joho/godotenv` v1.5.1. It does not search parent directories, the executable directory, or `.env.local`. A missing `.env` permits environment-only configuration; a present but unreadable or malformed file fails startup safely.
+
+File values and the inherited process environment are merged without mutating the process environment. An inherited environment variable overrides the **same key** from `.env`, including when its value is empty. An empty inherited `CONFLUENCE_API_TOKEN`, for example, overrides a file token and fails token validation.
+
+Set at least one URL variable. After merging, the first non-empty value wins in this order:
 
 | Priority | Variable | Purpose |
 | --- | --- | --- |
 | 1 | `CONFLUENCE_BASE_URL` | Confluence instance URL, including any context path |
 | 2 | `CONFLUENCE_API_BASE_PATH` | Alternative URL, which may already end in `/rest/api` |
 | 3 | `CONFLUENCE_HOST` | Alternative hostname or URL |
+
+Prefer setting only `CONFLUENCE_BASE_URL`. URL aliases retain their priority after merging: a `CONFLUENCE_BASE_URL` from `.env` takes priority over an inherited `CONFLUENCE_HOST`, because those are different keys.
 
 URLs must have a hostname, use `http` or `https`, and contain no query string or fragment. Values without a scheme default to HTTPS. The server preserves the context path and appends `/rest/api` unless the URL path already ends in `/rest/api`.
 
@@ -77,13 +103,37 @@ URLs must have a hostname, use `http` or `https`, and contain no query string or
 | `https://confluence.example.com/confluence` | `https://confluence.example.com/confluence/rest/api` |
 | `https://confluence.example.com/confluence/rest/api` | `https://confluence.example.com/confluence/rest/api` |
 
-Example environment for running from the repository root:
+As an optional alternative to `.env`, set the inherited environment when running from the repository root:
 
 ```bash
-export CONFLUENCE_API_TOKEN="your-server-personal-access-token"
-export CONFLUENCE_BASE_URL="https://confluence.example.com/confluence"
+export CONFLUENCE_API_TOKEN='replace-with-your-server-personal-access-token'
+export CONFLUENCE_BASE_URL='https://confluence.example.invalid/confluence'
 go run .
 ```
+
+Clients that use the `mcpServers` configuration format, such as Claude Desktop, can also supply environment variables directly. This client-specific format differs from the OpenCode example above:
+
+```json
+{
+  "mcpServers": {
+    "confluence": {
+      "command": "/absolute/path/confluence-mcp",
+      "env": {
+        "CONFLUENCE_API_TOKEN": "replace-with-your-server-personal-access-token",
+        "CONFLUENCE_BASE_URL": "https://confluence.example.invalid/confluence"
+      }
+    }
+  }
+}
+```
+
+### Authenticated startup
+
+After configuration and PAT validation, the server sends `GET /rest/api/user/current` under the configured Confluence context path before starting MCP stdio. It requires HTTP `200` and a JSON user object with `type: "known"`. This request uses the client's 30-second timeout and is not retried.
+
+Invalid configuration, an unreadable or malformed `.env`, anonymous users, HTML or invalid JSON responses, non-200 API responses (including `400`, `401`, and `403`), and network failures cause startup to exit with status `1`. Startup diagnostics go to stderr, omit secrets, and never include raw server response bodies; stdout remains reserved for MCP protocol traffic.
+
+This check proves authentication as a known user. Access to individual content and spaces still depends on that user's permissions.
 
 ## Tools
 
@@ -176,7 +226,7 @@ Use Go 1.25.5 and run checks from the repository root:
 ```bash
 go vet ./...
 go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
-go build -v ./...
+go build -v -o confluence-mcp .
 ```
 
 Configuration tests isolate `CONFLUENCE_API_TOKEN`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_API_BASE_PATH`, and `CONFLUENCE_HOST`; no production credentials are used. The automated tests use local HTTP fixtures to verify client contracts; they do not establish compatibility against a live Confluence installation.

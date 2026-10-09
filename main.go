@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 )
@@ -29,19 +31,30 @@ const (
 	maxRESTInt   = 1<<31 - 1
 )
 
-// loadConfig loads configuration from environment variables.
+// loadConfig reads cwd/.env without changing ENV; existing ENV wins per key.
 func loadConfig() (*ConfluenceConfig, error) {
-	token := os.Getenv("CONFLUENCE_API_TOKEN")
+	fileEnv, err := godotenv.Read(".env")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Parser errors may contain an entire input line, including credentials.
+		return nil, fmt.Errorf("cannot load .env: file is unreadable or invalid")
+	}
+	getEnv := func(name string) string {
+		if value, exists := os.LookupEnv(name); exists {
+			return value
+		}
+		return fileEnv[name]
+	}
+	token := getEnv("CONFLUENCE_API_TOKEN")
 	if token == "" {
-		return nil, fmt.Errorf("CONFLUENCE_API_TOKEN environment variable is required")
+		return nil, fmt.Errorf("CONFLUENCE_API_TOKEN is required (ENV or cwd/.env)")
 	}
 
-	rawURL := os.Getenv("CONFLUENCE_BASE_URL")
+	rawURL := getEnv("CONFLUENCE_BASE_URL")
 	if rawURL == "" {
-		rawURL = os.Getenv("CONFLUENCE_API_BASE_PATH")
+		rawURL = getEnv("CONFLUENCE_API_BASE_PATH")
 	}
 	if rawURL == "" {
-		rawURL = os.Getenv("CONFLUENCE_HOST")
+		rawURL = getEnv("CONFLUENCE_HOST")
 	}
 
 	if rawURL == "" {
@@ -57,7 +70,8 @@ func loadConfig() (*ConfluenceConfig, error) {
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid base URL: %w", err)
+		// url.Parse errors include the input, which can contain credentials.
+		return nil, fmt.Errorf("invalid base URL")
 	}
 
 	if u.Scheme != "http" && u.Scheme != "https" {
@@ -93,6 +107,37 @@ func NewConfluenceClient(config *ConfluenceConfig) *ConfluenceClient {
 			Timeout: 30 * time.Second,
 		},
 	}
+}
+
+// checkConnection verifies authentication before MCP starts. Never log response bodies.
+func (c *ConfluenceClient) checkConnection(ctx context.Context) error {
+	resp, err := c.executeRequest(ctx, "GET", "/user/current", nil, nil)
+	if err != nil {
+		// Keep the network cause, not a URL that could contain userinfo.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	var user struct {
+		Type string `json:"type"`
+	}
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&user); err != nil {
+		return fmt.Errorf("HTTP 200: invalid or unreadable current-user JSON")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("HTTP 200: invalid current-user JSON")
+	}
+	if user.Type != "known" {
+		return fmt.Errorf("HTTP 200: current user is not authenticated")
+	}
+	return nil
 }
 
 // executeRequest performs an authenticated HTTP request and returns the response.
@@ -605,6 +650,9 @@ func run(serve serveFunc) error {
 	}
 
 	client := NewConfluenceClient(config)
+	if err := client.checkConnection(context.Background()); err != nil {
+		return fmt.Errorf("bootstrap error: %w", err)
+	}
 	s := setupServer(client)
 
 	if err := serve(s); err != nil {

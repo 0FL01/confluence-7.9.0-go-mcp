@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,10 +12,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -1091,13 +1098,24 @@ func TestDoRequestReadError(t *testing.T) {
 // TestRun tests the run function.
 func TestRun(t *testing.T) {
 	resetConfigEnv(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/rest/api/user/current" || r.Header.Get("Authorization") != "Bearer token" {
+			t.Errorf("bootstrap request: %s %s", r.Method, r.URL)
+			http.Error(w, "invalid request", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"type":"known","username":"test-user"}`))
+	}))
+	defer server.Close()
 	t.Run("success", func(t *testing.T) {
 		t.Setenv("CONFLUENCE_API_TOKEN", "token")
-		t.Setenv("CONFLUENCE_BASE_URL", "http://localhost")
+		t.Setenv("CONFLUENCE_BASE_URL", server.URL)
+		served := false
 		err := run(func(s *mcpserver.MCPServer) error {
+			served = true
 			return nil // dummy serve
 		})
-		if err != nil {
+		if err != nil || !served {
 			t.Errorf("expected no error, got %v", err)
 		}
 	})
@@ -1114,7 +1132,7 @@ func TestRun(t *testing.T) {
 
 	t.Run("serve error", func(t *testing.T) {
 		t.Setenv("CONFLUENCE_API_TOKEN", "token")
-		t.Setenv("CONFLUENCE_BASE_URL", "http://localhost")
+		t.Setenv("CONFLUENCE_BASE_URL", server.URL)
 		err := run(func(s *mcpserver.MCPServer) error {
 			return fmt.Errorf("serve failed")
 		})
@@ -1126,8 +1144,13 @@ func TestRun(t *testing.T) {
 
 func resetConfigEnv(t *testing.T) {
 	t.Helper()
+	t.Chdir(t.TempDir())
 	for _, name := range []string{"CONFLUENCE_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_API_BASE_PATH", "CONFLUENCE_HOST"} {
+		// Register restoration before unsetting: empty ENV must override .env.
 		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -1574,6 +1597,306 @@ func TestResponseBodyClosure(t *testing.T) {
 			}
 			if (err != nil) != tc.fail || !body.closed {
 				t.Fatalf("err=%v closed=%v", err, body.closed)
+			}
+		})
+	}
+}
+
+func TestLoadConfigDotenv(t *testing.T) {
+	const file = "# Private configuration\nexport CONFLUENCE_API_TOKEN='file-token#=$LITERAL'\nCONFLUENCE_BASE_URL=\"https://file.test/wiki\"\n"
+	for _, tc := range []struct {
+		name, file, wantURL, wantToken, wantError string
+		present                                   bool
+		env                                       map[string]string
+	}{
+		{"file only", file, "https://file.test/wiki/rest/api", "file-token#=$LITERAL", "", true, nil},
+		{"ENV only", "", "https://env.test/rest/api", "env-token", "", false, map[string]string{"CONFLUENCE_API_TOKEN": "env-token", "CONFLUENCE_BASE_URL": "env.test"}},
+		{"missing file and settings", "", "", "", "CONFLUENCE_API_TOKEN", false, nil},
+		{"empty file", "", "https://env.test/rest/api", "env-token", "", true, map[string]string{"CONFLUENCE_API_TOKEN": "env-token", "CONFLUENCE_HOST": "env.test"}},
+		{"ENV wins same keys", file, "http://env.test/context/rest/api", "env-token", "", true, map[string]string{"CONFLUENCE_API_TOKEN": "env-token", "CONFLUENCE_BASE_URL": "http://env.test/context/"}},
+		{"mixed sources", file, "https://file.test/wiki/rest/api", "env-token", "", true, map[string]string{"CONFLUENCE_API_TOKEN": "env-token"}},
+		{"empty ENV token wins", file, "", "", "CONFLUENCE_API_TOKEN", true, map[string]string{"CONFLUENCE_API_TOKEN": ""}},
+		{"alias precedence after merge", file, "https://file.test/wiki/rest/api", "file-token#=$LITERAL", "", true, map[string]string{"CONFLUENCE_HOST": "env.test"}},
+		{"API alias", "CONFLUENCE_API_TOKEN='file-token'\nCONFLUENCE_API_BASE_PATH=https://api.test/wiki/rest/api/\nCONFLUENCE_HOST=host.test\n", "https://api.test/wiki/rest/api", "file-token", "", true, nil},
+		{"empty ENV URL wins then alias", file + "CONFLUENCE_HOST=host.test\n", "https://host.test/rest/api", "file-token#=$LITERAL", "", true, map[string]string{"CONFLUENCE_BASE_URL": ""}},
+		{"invalid dotenv", "CONFLUENCE_API_TOKEN='SECRET_DOTENV_MARKER\n", "", "", "cannot load .env", true, map[string]string{"CONFLUENCE_API_TOKEN": "env-token", "CONFLUENCE_HOST": "env.test"}},
+		{"invalid URL without credentials in error", "CONFLUENCE_API_TOKEN='file-token'\nCONFLUENCE_BASE_URL='https://user:SECRET_DOTENV_MARKER@host.test/%zz'\n", "", "", "invalid base URL", true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetConfigEnv(t)
+			if tc.present {
+				if err := os.WriteFile(".env", []byte(tc.file), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			config, err := loadConfig()
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) || strings.Contains(err.Error(), "SECRET_DOTENV_MARKER") {
+					t.Fatalf("configuration error: %v", err)
+				}
+				return
+			}
+			if err != nil || config.BaseURL != tc.wantURL || config.Token != tc.wantToken {
+				t.Fatalf("wrong configuration or unexpected error: %v", err)
+			}
+			if _, supplied := tc.env["CONFLUENCE_API_TOKEN"]; !supplied {
+				if _, exists := os.LookupEnv("CONFLUENCE_API_TOKEN"); exists {
+					t.Fatal("dotenv mutated process ENV")
+				}
+			}
+		})
+	}
+	t.Run("unreadable file", func(t *testing.T) {
+		resetConfigEnv(t)
+		if err := os.Mkdir(".env", 0700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "cannot load .env") {
+			t.Fatalf("accepted unreadable dotenv: %v", err)
+		}
+	})
+	t.Run("no alternate lookup or unrelated ENV mutation", func(t *testing.T) {
+		resetConfigEnv(t)
+		t.Setenv("UNRELATED_DOTENV_KEY", "original")
+		if err := os.WriteFile(".env", []byte(file+"UNRELATED_DOTENV_KEY=changed\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(); err != nil || os.Getenv("UNRELATED_DOTENV_KEY") != "original" {
+			t.Fatalf("dotenv changed unrelated ENV: %v", err)
+		}
+		if err := os.WriteFile(".env.local", []byte(file), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir("child", 0700); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir("child")
+		if err := os.WriteFile(".env.local", []byte(file), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "CONFLUENCE_API_TOKEN") {
+			t.Fatalf("loaded parent or .env.local: %v", err)
+		}
+	})
+}
+
+func TestCheckConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload, wantError string
+		status                   int
+	}{
+		{"authenticated", `{"type":"known","username":"test-user"}`, "", 200},
+		{"anonymous", `{"type":"anonymous"}`, "not authenticated", 200},
+		{"missing type", `{}`, "not authenticated", 200},
+		{"invalid type", `{"type":null}`, "not authenticated", 200},
+		{"HTML login", `<html>SECRET_RESPONSE_MARKER</html>`, "JSON", 200},
+		{"truncated JSON", `{"type":"known"`, "JSON", 200},
+		{"trailing JSON", `{"type":"known"}{}`, "JSON", 200},
+		{"bad request", `SECRET_RESPONSE_MARKER`, "HTTP 400 Bad Request", 400},
+		{"unauthorized", `SECRET_RESPONSE_MARKER`, "HTTP 401 Unauthorized", 401},
+		{"forbidden", `SECRET_RESPONSE_MARKER`, "HTTP 403 Forbidden", 403},
+		{"not found", `SECRET_RESPONSE_MARKER`, "HTTP 404 Not Found", 404},
+		{"unavailable", `SECRET_RESPONSE_MARKER`, "HTTP 503 Service Unavailable", 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/confluence/rest/api", Token: "test-token"})
+			type contextKey struct{}
+			ctx := context.WithValue(context.Background(), contextKey{}, "marker")
+			body := &trackingBody{Reader: strings.NewReader(tc.payload)}
+			calls := 0
+			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.Method != http.MethodGet || r.URL.String() != "https://example.test/confluence/rest/api/user/current" || r.Context().Value(contextKey{}) != "marker" || r.Header.Get("Authorization") != "Bearer test-token" {
+					t.Errorf("bootstrap request/context/auth mismatch")
+				}
+				return &http.Response{StatusCode: tc.status, Body: body}, nil
+			})
+			err := client.checkConnection(ctx)
+			if tc.wantError == "" && err != nil || tc.wantError != "" && (err == nil || !strings.Contains(err.Error(), tc.wantError)) {
+				t.Fatalf("bootstrap error: %v, want %q", err, tc.wantError)
+			}
+			if err != nil && strings.Contains(err.Error(), "SECRET_RESPONSE_MARKER") {
+				t.Fatal("response body leaked into bootstrap error")
+			}
+			if calls != 1 || !body.closed {
+				t.Fatalf("calls=%d body.closed=%v", calls, body.closed)
+			}
+		})
+	}
+	t.Run("response read error", func(t *testing.T) {
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/rest/api", Token: "test"})
+		body := &trackingBody{Reader: iotest.ErrReader(errors.New("SECRET_RESPONSE_MARKER"))}
+		client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: body}, nil
+		})
+		if err := client.checkConnection(context.Background()); err == nil || strings.Contains(err.Error(), "SECRET_RESPONSE_MARKER") || !body.closed {
+			t.Fatalf("read error/closure: %v, closed=%v", err, body.closed)
+		}
+	})
+	t.Run("cancellation and transport cause without URL userinfo", func(t *testing.T) {
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://SECRET_URL_MARKER@example.test/rest/api", Token: "test"})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, r.Context().Err()
+		})
+		if err := client.checkConnection(ctx); !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "SECRET_URL_MARKER") {
+			t.Fatalf("transport cause/redaction: %v", err)
+		}
+	})
+}
+
+func TestRunDotenvBootstrap(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload, wantError string
+		status                   int
+	}{
+		{"success", `{"type":"known"}`, "", 200},
+		{"unauthorized", `SECRET_RESPONSE_MARKER`, "HTTP 401", 401},
+		{"anonymous", `{"type":"anonymous"}`, "not authenticated", 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetConfigEnv(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/wiki/rest/api/user/current" || r.Header.Get("Authorization") != "Bearer dotenv-test-token" {
+					t.Errorf("wrong bootstrap path/auth")
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.payload))
+			}))
+			defer server.Close()
+			file := fmt.Sprintf("CONFLUENCE_API_TOKEN='dotenv-test-token'\nCONFLUENCE_BASE_URL=%s/wiki\n", server.URL)
+			if err := os.WriteFile(".env", []byte(file), 0600); err != nil {
+				t.Fatal(err)
+			}
+			served := false
+			err := run(func(*mcpserver.MCPServer) error { served = true; return nil })
+			if tc.wantError == "" {
+				if err != nil || !served {
+					t.Fatalf("successful bootstrap did not serve: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "bootstrap error") || !strings.Contains(err.Error(), tc.wantError) || served || strings.Contains(err.Error(), "SECRET_RESPONSE_MARKER") {
+				t.Fatalf("failed bootstrap err=%v served=%v", err, served)
+			}
+		})
+	}
+	t.Run("invalid dotenv never serves", func(t *testing.T) {
+		resetConfigEnv(t)
+		if err := os.WriteFile(".env", []byte("CONFLUENCE_API_TOKEN='SECRET_DOTENV_MARKER"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		served := false
+		err := run(func(*mcpserver.MCPServer) error { served = true; return nil })
+		if err == nil || !strings.Contains(err.Error(), "configuration error") || served || strings.Contains(err.Error(), "SECRET_DOTENV_MARKER") {
+			t.Fatalf("configuration error err=%v served=%v", err, served)
+		}
+	})
+}
+
+// TestBinaryBootstrap also accepts an installed binary for post-install verification.
+func TestBinaryBootstrap(t *testing.T) {
+	binary := os.Getenv("CONFLUENCE_MCP_TEST_BINARY")
+	if binary == "" {
+		binary = filepath.Join(t.TempDir(), "confluence-mcp")
+		build := exec.Command("go", "build", "-o", binary, ".")
+		if output, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build smoke binary: %v\n%s", err, output)
+		}
+	}
+	for _, tc := range []struct {
+		name, body, wantError string
+		status                int
+		invalidFile, offline  bool
+	}{
+		{"authenticated MCP", `{"type":"known","username":"test-user"}`, "", 200, false, false},
+		{"HTTP 401", "SECRET_RESPONSE_MARKER", "HTTP 401 Unauthorized", 401, false, false},
+		{"anonymous", `{"type":"anonymous"}`, "not authenticated", 200, false, false},
+		{"invalid file", "", "configuration error: cannot load .env", 200, true, false},
+		{"offline", "", "bootstrap error: request failed", 200, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != http.MethodGet || r.URL.Path != "/wiki/rest/api/user/current" || r.Header.Get("Authorization") != "Bearer binary-test-token" {
+					t.Errorf("installed binary bootstrap path/auth mismatch")
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer backend.Close()
+			if tc.offline {
+				backend.Close()
+			}
+			cwd := t.TempDir()
+			file := fmt.Sprintf("CONFLUENCE_API_TOKEN='binary-test-token'\nCONFLUENCE_BASE_URL=%s/wiki\n", backend.URL)
+			if tc.invalidFile {
+				file = "CONFLUENCE_API_TOKEN='SECRET_DOTENV_MARKER"
+			}
+			if err := os.WriteFile(filepath.Join(cwd, ".env"), []byte(file), 0600); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, binary)
+			command.Dir = cwd
+			for _, env := range os.Environ() {
+				key, _, _ := strings.Cut(env, "=")
+				if !slices.Contains([]string{"CONFLUENCE_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_API_BASE_PATH", "CONFLUENCE_HOST"}, key) {
+					command.Env = append(command.Env, env)
+				}
+			}
+			var stderr bytes.Buffer
+			command.Stderr = &stderr
+			if tc.wantError != "" {
+				var stdout bytes.Buffer
+				command.Stdout = &stdout
+				err := command.Run()
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), tc.wantError) {
+					t.Fatalf("startup failure: err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+				}
+				if strings.Contains(stderr.String(), "SECRET_") || strings.Contains(stderr.String(), "binary-test-token") {
+					t.Fatal("startup leaked credentials or response body")
+				}
+			} else {
+				stdin, err := command.StdinPipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				stdout, err := command.StdoutPipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := command.Start(); err != nil {
+					t.Fatal(err)
+				}
+				_, writeErr := io.WriteString(stdin, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"binary-smoke","version":"1"}}}`+"\n")
+				line, readErr := bufio.NewReader(stdout).ReadBytes('\n')
+				_ = stdin.Close()
+				waitErr := command.Wait()
+				var reply struct {
+					ID     int             `json:"id"`
+					Error  json.RawMessage `json:"error"`
+					Result struct {
+						ServerInfo struct {
+							Name string `json:"name"`
+						} `json:"serverInfo"`
+					} `json:"result"`
+				}
+				if writeErr != nil || readErr != nil || waitErr != nil || json.Unmarshal(line, &reply) != nil || reply.ID != 1 || len(reply.Error) != 0 || reply.Result.ServerInfo.Name != "confluence-7.9.0-go-mcp" || stderr.Len() != 0 {
+					t.Fatalf("MCP initialization: write=%v read=%v exit=%v frame=%q stderr=%q", writeErr, readErr, waitErr, line, stderr.String())
+				}
+			}
+			wantCalls := int32(1)
+			if tc.invalidFile || tc.offline {
+				wantCalls = 0
+			}
+			if calls.Load() != wantCalls {
+				t.Fatalf("bootstrap made %d HTTP calls, want %d", calls.Load(), wantCalls)
 			}
 		})
 	}
